@@ -1,0 +1,59 @@
+GVX Desktop amd64 builder VM assets — Third-Party Licenses and Notices
+
+This archive distributes unmodified binaries and configuration derived from the
+following open-source software. Exact pinned versions, checksums, immutable
+Alpine aports commits, and upstream source locations are listed in SOURCES.
+Full license texts are provided alongside this file in LICENSES/.
+
+- Linux kernel (linux-virt 6.18.64-r0)
+  License: GPL-2.0-only (see LICENSES/GPL-2.0.txt)
+  Copyright: The Linux Kernel contributors
+
+- BusyBox (busybox-static 1.37.0-r31)
+  License: GPL-2.0-only (see LICENSES/GPL-2.0.txt)
+  Copyright: Erik Andersen, Rob Landley, Denys Vlasenko, and contributors
+
+- e2fsprogs, e2fsprogs-libs, libcom_err (1.47.4-r0)
+  License: GPL-2.0-or-later AND LGPL-2.0-or-later AND BSD-3-Clause AND MIT
+  (see LICENSES/GPL-2.0.txt, LICENSES/LGPL-2.1.txt, LICENSES/BSD-3-Clause-util-linux.txt, LICENSES/MIT-musl.txt)
+  Copyright: Theodore Ts'o and contributors
+
+- util-linux: blkid, libblkid, libuuid (2.42.3-r1)
+  - blkid:    GPL-2.0-or-later (see LICENSES/GPL-2.0.txt)
+  - libblkid: LGPL-2.1-or-later (see LICENSES/LGPL-2.1.txt)
+  - libuuid:  BSD-3-Clause (see LICENSES/BSD-3-Clause-util-linux.txt)
+  Copyright: Karel Zak, Theodore Ts'o, and util-linux contributors
+
+- libeconf (0.8.3-r0)
+  License: MIT (see LICENSES/MIT-libeconf.txt)
+  Copyright: SUSE LLC and libeconf contributors
+
+- musl libc (1.2.6-r3)
+  License: MIT (see LICENSES/MIT-musl.txt)
+  Copyright: Rich Felker et al.
+
+- BuildKit: buildkitd, buildctl (moby/buildkit v0.34.2)
+  License: Apache-2.0 (see LICENSES/Apache-2.0.txt)
+  Copyright: BuildKit authors / Moby Project
+
+- runc: buildkit-runc (opencontainers/runc v1.5.2)
+  License: Apache-2.0 (see LICENSES/Apache-2.0.txt)
+  Copyright: Open Container Initiative / runc authors
+
+- libseccomp (2.6.1-r0, statically linked into buildkit-runc)
+  License: LGPL-2.1-or-later (see LICENSES/LGPL-2.1.txt)
+  Copyright: Paul Moore, Tom Hromatka, and libseccomp contributors
+
+- Mozilla CA Certificate Bundle (Alpine ca-certificates-bundle 20261020-r0)
+  License: MPL-2.0 AND MIT (see LICENSES/MPL-2.0.txt)
+  Copyright: Mozilla Contributors and Alpine Linux ca-certificates contributors
+
+- GVX Desktop guest agent (gvx-agent)
+  License: Apache-2.0 (see LICENSES/Apache-2.0.txt)
+  Copyright: GVX Desktop contributors
+
+Corresponding Source:
+For all GPL/LGPL/MPL-covered components, the complete corresponding source
+(upstream source tarballs verified against the pinned APKBUILD checksums,
+pinned Alpine aports recipes and patches, and BuildKit/runc source archives)
+is published alongside this release archive as gvx-vm-assets-v1-sources.tar.gz.

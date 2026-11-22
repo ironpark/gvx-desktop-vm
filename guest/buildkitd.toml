@@ -1,0 +1,32 @@
+# BuildKit configuration for the GVX Desktop amd64 builder VM.
+#
+# The worker declares both linux/amd64 (via Rosetta) and linux/arm64 (native)
+# because buildkitd's automatic platform probe chroots without /proc, where
+# Rosetta cannot start. On the host, buildx registers this node for
+# linux/amd64 only, so native builds stay on the gvx sandbox node.
+root = "/var/lib/gvx/buildkit"
+
+[worker.oci]
+  enabled = true
+  platforms = ["linux/amd64", "linux/arm64"]
+  snapshotter = "overlayfs"
+  gc = true
+  reservedSpace = "2GB"
+  maxUsedSpace = "20GB"
+  minFreeSpace = "10%"
+
+  [[worker.oci.gcpolicy]]
+    reservedSpace = "1GB"
+    keepDuration = "48h"
+    filters = ["type==source.local", "type==exec.cachemount", "type==source.git.checkout"]
+
+  [[worker.oci.gcpolicy]]
+    reservedSpace = "4GB"
+    keepDuration = "1440h"
+
+  [[worker.oci.gcpolicy]]
+    all = true
+    maxUsedSpace = "20GB"
+
+[worker.containerd]
+  enabled = false

@@ -1,0 +1,69 @@
+#!/bin/busybox sh
+# What busybox init runs once, before it starts the agent: the kernel's
+# filesystems, the modules the initramfs carries, then what the host asked
+# for on the kernel command line (gvx.assets, gvx.rosetta, gvx.net, gvx.shares).
+/bin/busybox --install -s /bin
+export PATH=/sbin:/bin
+mount -t proc proc /proc
+mount -t sysfs sys /sys
+mkdir -p /dev/pts /dev/shm /etc/ssl/certs
+mount -t devpts devpts /dev/pts
+mount -t tmpfs tmpfs /dev/shm
+mount -t tmpfs tmpfs /run
+mount -t tmpfs tmpfs /tmp
+mount -t cgroup2 cgroup2 /sys/fs/cgroup
+while read -r m; do
+	[ -z "$m" ] && continue
+	insmod "/lib/modules/$m" || echo "rc: insmod $m failed"
+done < /lib/modules/load.list
+# Keep child network namespaces (runc build containers) isolated from host vsock
+# when the kernel exposes vsock namespace modes.
+if [ -w /proc/sys/net/vsock/child_ns_mode ]; then
+	echo local > /proc/sys/net/vsock/child_ns_mode || true
+fi
+hostname gvx-amd64
+ip link set lo up
+
+assets= rosetta= net= shares=
+for arg in $(cat /proc/cmdline); do
+	case "$arg" in
+	gvx.assets=*) assets=${arg#gvx.assets=} ;;
+	gvx.rosetta=*) rosetta=${arg#gvx.rosetta=} ;;
+	gvx.net=1) net=1 ;;
+	gvx.shares=*) shares=${arg#gvx.shares=} ;;
+	esac
+done
+
+if [ -n "$assets" ]; then
+	mkdir -p "/mnt/$assets"
+	mount -t virtiofs -o ro "$assets" "/mnt/$assets" || echo "rc: mount $assets failed"
+	if [ -f "/mnt/$assets/buildkit/certs/ca-certificates.crt" ]; then
+		ln -sf "/mnt/$assets/buildkit/certs/ca-certificates.crt" /etc/ssl/certs/ca-certificates.crt
+	fi
+fi
+
+# Extra virtiofs shares, if the host asked for any (tag or tag:ro).
+for s in $(echo "$shares" | tr , ' '); do
+	tag=${s%:ro}
+	opt=rw
+	[ "$tag" != "$s" ] && opt=ro
+	mkdir -p "/mnt/$tag"
+	mount -t virtiofs -o "$opt" "$tag" "/mnt/$tag" || echo "rc: mount $tag failed"
+done
+
+# Rosetta is a virtiofs share holding the translator. Register it with
+# binfmt_misc using flags C (credentials) and F (fix-binary), which opens
+# the translator now so it works inside chroots and runc mount namespaces.
+if [ -n "$rosetta" ]; then
+	mkdir -p "/mnt/$rosetta"
+	mount -t virtiofs "$rosetta" "/mnt/$rosetta" || echo "rc: mount $rosetta failed"
+	mount -t binfmt_misc binfmt_misc /proc/sys/fs/binfmt_misc
+	printf '%s' ":rosetta:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\x3e\x00:\xff\xff\xff\xff\xff\xfe\xfe\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/mnt/$rosetta/rosetta:CF" \
+		> /proc/sys/fs/binfmt_misc/register || echo "rc: binfmt registration failed"
+fi
+
+if [ -n "$net" ]; then
+	ip link set eth0 up
+	udhcpc -i eth0 -s /etc/udhcpc.sh -b -t 20 -T 1 >/dev/null 2>&1 &
+fi
+echo "GVX-RC-DONE uptime=$(cut -d' ' -f1 /proc/uptime)"

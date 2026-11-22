@@ -1,0 +1,3 @@
+::sysinit:/etc/rc
+::respawn:/bin/gvx-agent
+::ctrlaltdel:/bin/busybox reboot -f

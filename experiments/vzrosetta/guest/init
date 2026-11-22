@@ -1,0 +1,13 @@
+#!/bin/busybox sh
+# PID 1 of the initramfs. The kernel's first root cannot be pivoted out
+# of, which runc does for every container, so everything is copied to a
+# tmpfs and that is made the root; busybox init goes on from /etc/inittab.
+bb=/bin/busybox
+$bb mount -t proc proc /proc
+$bb echo "VZ-INIT uptime=$($bb cut -d' ' -f1 /proc/uptime)"
+$bb mount -t tmpfs -o mode=0755 tmpfs /newroot
+$bb cp -a /bin /etc /lib /newroot/
+$bb mkdir -p /newroot/proc /newroot/sys /newroot/dev /newroot/run /newroot/tmp /newroot/mnt /newroot/var /newroot/root
+$bb mount -t devtmpfs dev /newroot/dev
+$bb umount /proc
+exec $bb switch_root /newroot /bin/busybox init

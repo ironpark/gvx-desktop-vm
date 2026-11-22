@@ -1,0 +1,3 @@
+::sysinit:/etc/rc
+::respawn:/bin/vzagent
+::ctrlaltdel:/bin/busybox reboot -f

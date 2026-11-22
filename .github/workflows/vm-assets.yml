@@ -1,0 +1,157 @@
+name: VM Assets
+
+# Builds the amd64 builder VM's assets (kernel, initramfs, guest agent,
+# buildkitd binaries, license/notice texts, manifest, SOURCES, and the
+# corresponding-source archive) reproducibly from pinned upstream inputs
+# and attaches them to a vm-assets-v* GitHub release.
+#
+# Pushing a tag vm-assets-v<N> (matching vmassets.Version) builds the
+# binary archive twice from two empty caches to verify reproducibility,
+# builds the corresponding-source archive, and creates or updates that
+# release. Running by hand (workflow_dispatch) builds and checks
+# reproducibility without publishing unless a tag is given.
+on:
+  push:
+    tags: ['vm-assets-v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Optional existing or new vm-assets-v* tag to publish to (leave empty for a dry run)
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: vm-assets
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Pin an exact Go patch version so the statically linked guest agent
+      # builds byte-identically across runs and matches local verification.
+      - uses: actions/setup-go@v7
+        with:
+          go-version: '1.27.4'
+
+      - name: Version
+        id: version
+        run: |
+          version="$(sed -n 's/^const Version = "\(.*\)"$/\1/p' vmassets/vmassets.go)"
+          if [ -z "$version" ]; then
+            echo "::error::could not read Version from vmassets/vmassets.go"
+            exit 1
+          fi
+          expected_tag="vm-assets-v${version}"
+          archive="gvx-vm-assets-v${version}-arm64.tar.gz"
+          sources_archive="gvx-vm-assets-v${version}-sources.tar.gz"
+          publish_tag=""
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            if [ "$GITHUB_REF_NAME" != "$expected_tag" ]; then
+              echo "::error::tag is $GITHUB_REF_NAME, vmassets/vmassets.go says $expected_tag"
+              exit 1
+            fi
+            publish_tag="$GITHUB_REF_NAME"
+          elif [ -n "${{ inputs.tag }}" ]; then
+            if [ "${{ inputs.tag }}" != "$expected_tag" ]; then
+              echo "::error::input tag is ${{ inputs.tag }}, vmassets/vmassets.go says $expected_tag"
+              exit 1
+            fi
+            publish_tag="${{ inputs.tag }}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+          echo "sources_archive=$sources_archive" >> "$GITHUB_OUTPUT"
+          echo "publish_tag=$publish_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Test guest packages
+        run: go test -short ./guest/...
+
+      - name: Build assets twice, verify reproducibility, and pack corresponding sources
+        id: build
+        env:
+          ARCHIVE: ${{ steps.version.outputs.archive }}
+          SOURCES_ARCHIVE: ${{ steps.version.outputs.sources_archive }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/run1" "$RUNNER_TEMP/run2"
+          go run ./guest/mkassets \
+            -out "$RUNNER_TEMP/run1/assets" \
+            -archive "$RUNNER_TEMP/run1/$ARCHIVE" \
+            -sources-archive "$RUNNER_TEMP/run1/$SOURCES_ARCHIVE" \
+            -cache "$RUNNER_TEMP/cache1"
+          go run ./guest/mkassets \
+            -out "$RUNNER_TEMP/run2/assets" \
+            -archive "$RUNNER_TEMP/run2/$ARCHIVE" \
+            -cache "$RUNNER_TEMP/cache2"
+
+          sha1="$(cut -d' ' -f1 "$RUNNER_TEMP/run1/$ARCHIVE.sha256")"
+          sha2="$(cut -d' ' -f1 "$RUNNER_TEMP/run2/$ARCHIVE.sha256")"
+          if [ "$sha1" != "$sha2" ]; then
+            echo "::error::builds are not reproducible: $sha1 vs $sha2"
+            exit 1
+          fi
+          size="$(stat -c%s "$RUNNER_TEMP/run1/$ARCHIVE")"
+          src_sha="$(cut -d' ' -f1 "$RUNNER_TEMP/run1/$SOURCES_ARCHIVE.sha256")"
+          src_size="$(stat -c%s "$RUNNER_TEMP/run1/$SOURCES_ARCHIVE")"
+          echo "Reproducible build verified: sha256=$sha1 size=$size"
+          echo "Corresponding sources archive: sha256=$src_sha size=$src_size"
+
+          mkdir -p dist
+          cp "$RUNNER_TEMP/run1/$ARCHIVE" "dist/$ARCHIVE"
+          cp "$RUNNER_TEMP/run1/$ARCHIVE.sha256" "dist/$ARCHIVE.sha256"
+          cp "$RUNNER_TEMP/run1/$SOURCES_ARCHIVE" "dist/$SOURCES_ARCHIVE"
+          cp "$RUNNER_TEMP/run1/$SOURCES_ARCHIVE.sha256" "dist/$SOURCES_ARCHIVE.sha256"
+          cp "$RUNNER_TEMP/run1/assets/SOURCES" "dist/SOURCES"
+          cp "$RUNNER_TEMP/run1/assets/manifest.json" "dist/manifest.json"
+
+          echo "sha256=$sha1" >> "$GITHUB_OUTPUT"
+          echo "size=$size" >> "$GITHUB_OUTPUT"
+          echo "sources_sha256=$src_sha" >> "$GITHUB_OUTPUT"
+          echo "sources_size=$src_size" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## VM Assets v${{ steps.version.outputs.version }}"
+            echo ""
+            echo "Paste into \`vmassets/vmassets.go\`:"
+            echo '```go'
+            echo "const ArchiveSHA256 = \"$sha1\""
+            echo "const ArchiveSize int64 = $size"
+            echo '```'
+            echo ""
+            echo "Corresponding source archive: \`$SOURCES_ARCHIVE\` ($src_size bytes, sha256 \`$src_sha\`)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.version.outputs.archive }}
+          path: dist/*
+          retention-days: 7
+
+      - name: Publish release
+        if: steps.version.outputs.publish_tag != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.publish_tag }}
+          VERSION: ${{ steps.version.outputs.version }}
+          ARCHIVE: ${{ steps.version.outputs.archive }}
+          SHA256: ${{ steps.build.outputs.sha256 }}
+          SIZE: ${{ steps.build.outputs.size }}
+          SOURCES_ARCHIVE: ${{ steps.version.outputs.sources_archive }}
+          SOURCES_SHA256: ${{ steps.build.outputs.sources_sha256 }}
+          SOURCES_SIZE: ${{ steps.build.outputs.sources_size }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* \
+              --title "VM Assets v$VERSION" \
+              --notes "Reproducible amd64 builder VM assets (arm64 Linux kernel, initramfs, guest agent, BuildKit, license texts).
+
+- Binary archive: \`$ARCHIVE\` (\`$SIZE\` bytes, SHA-256 \`$SHA256\`)
+- Corresponding sources: \`$SOURCES_ARCHIVE\` (\`$SOURCES_SIZE\` bytes, SHA-256 \`$SOURCES_SHA256\`)
+
+Exact upstream sources, immutable Alpine aports commits, and licenses are listed in \`SOURCES\`."
+          fi
