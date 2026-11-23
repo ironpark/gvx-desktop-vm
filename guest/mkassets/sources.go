@@ -159,20 +159,24 @@ func fetchAportsRecipe(ctx context.Context, client *http.Client, cacheDir string
 			return nil, err
 		}
 		var lastErr error
-		for attempt := 1; attempt <= 3; attempt++ {
-			if attempt > 1 {
-				select {
-				case <-ctx.Done():
-					return nil, ctx.Err()
-				case <-time.After(time.Duration(attempt) * time.Second):
+	fetch:
+		for _, url := range []string{r.ArchiveURL(), r.MirrorArchiveURL()} {
+			for attempt := 1; attempt <= 3; attempt++ {
+				if attempt > 1 {
+					select {
+					case <-ctx.Done():
+						return nil, ctx.Err()
+					case <-time.After(time.Duration(attempt) * time.Second):
+					}
 				}
+				err := downloadRaw(ctx, client, url, tarPath)
+				if err == nil {
+					lastErr = nil
+					break fetch
+				}
+				lastErr = err
 			}
-			err := downloadRaw(ctx, client, r.ArchiveURL(), tarPath)
-			if err == nil {
-				lastErr = nil
-				break
-			}
-			lastErr = err
+			fmt.Printf("mkassets: %s: %v\n", url, lastErr)
 		}
 		if lastErr != nil {
 			return nil, lastErr
@@ -325,7 +329,14 @@ func buildSourcesArchive(ctx context.Context, client *http.Client, repoDir, cach
 				matchedUpstream[e.Filename] = true
 				upCache := filepath.Join(srcCache, "upstream", r.Origin, e.Filename)
 				fmt.Printf("mkassets: fetch upstream %s\n", u.Filename)
-				if err := downloadPinnedSHA512(ctx, client, u.URL, upCache, u.SHA512); err != nil {
+				var err error
+				for _, url := range append([]string{u.URL}, u.Mirrors...) {
+					if err = downloadPinnedSHA512(ctx, client, url, upCache, u.SHA512); err == nil {
+						break
+					}
+					fmt.Printf("mkassets: %s: %v\n", url, err)
+				}
+				if err != nil {
 					return "", 0, fmt.Errorf("sources upstream %s: %w", u.Filename, err)
 				}
 				if err := copyFile(upCache, filepath.Join(stageDir, "upstream", r.Origin, e.Filename), 0o644); err != nil {

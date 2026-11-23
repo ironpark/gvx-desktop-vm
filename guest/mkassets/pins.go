@@ -137,8 +137,16 @@ var pinnedAPKs = []apkPin{
 type upstreamSource struct {
 	Filename string // filename as named in APKBUILD's sha512sums
 	URL      string
-	SHA512   string
+	// Mirrors are tried in order when URL fails; the SHA-512 pins the file
+	// whichever serves it.
+	Mirrors []string
+	SHA512  string
 }
+
+// alpineDistfiles is Alpine's own cache of the upstream sources its
+// builders fetched. gitlab.alpinelinux.org answers CI runners with HTTP
+// 418, so a source hosted there names its copy here as a mirror.
+const alpineDistfiles = "https://distfiles.alpinelinux.org/distfiles/edge/"
 
 // aportsRecipe pins an Alpine aports recipe at an immutable commit SHA, its
 // exact APKBUILD SHA-256, and its upstream source tarballs for corresponding
@@ -162,6 +170,13 @@ func (r aportsRecipe) RawFileURL(name string) string {
 
 func (r aportsRecipe) ArchiveURL() string {
 	return fmt.Sprintf("%s?sha=%s&path=main/%s", alpineAportsAPI, r.Commit, r.Origin)
+}
+
+// MirrorArchiveURL is the whole aports tree at the commit from GitHub's
+// mirror, for when gitlab.alpinelinux.org turns a CI runner away; the
+// recipe is read from it by path and checked against APKBUILDSHA256.
+func (r aportsRecipe) MirrorArchiveURL() string {
+	return fmt.Sprintf("https://github.com/alpinelinux/aports/archive/%s.tar.gz", r.Commit)
 }
 
 // aportsRecipes covers every Alpine origin whose binaries or libraries are
@@ -281,6 +296,7 @@ var aportsRecipes = []aportsRecipe{
 			{
 				Filename: "ca-certificates-20261020.tar.bz2",
 				URL:      "https://gitlab.alpinelinux.org/alpine/ca-certificates/-/archive/20261020/ca-certificates-20261020.tar.bz2",
+				Mirrors:  []string{alpineDistfiles + "ca-certificates-20261020.tar.bz2"},
 				SHA512:   "d28eb01751b1a914ffb5d8cb99e662f0a35a95148c21dcf98de1ab3108b54db9714a99472d07715023867f4f76a21f2a79a2bc1c7e9876ce5167fdd865ad2dd7",
 			},
 		},
