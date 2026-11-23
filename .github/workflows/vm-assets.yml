@@ -146,12 +146,10 @@ jobs:
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" dist/* --clobber
           else
-            gh release create "$TAG" dist/* \
-              --title "VM Assets v$VERSION" \
-              --notes "Reproducible amd64 builder VM assets (arm64 Linux kernel, initramfs, guest agent, BuildKit, license texts).
-
-- Binary archive: \`$ARCHIVE\` (\`$SIZE\` bytes, SHA-256 \`$SHA256\`)
-- Corresponding sources: \`$SOURCES_ARCHIVE\` (\`$SOURCES_SIZE\` bytes, SHA-256 \`$SOURCES_SHA256\`)
-
-Exact upstream sources, immutable Alpine aports commits, and licenses are listed in \`SOURCES\`."
+            notes="$(printf '%s\n\n%s\n%s\n\n%s\n' \
+              "Reproducible amd64 builder VM assets (arm64 Linux kernel, initramfs, guest agent, BuildKit, license texts)." \
+              "- Binary archive: \`$ARCHIVE\` ($SIZE bytes, SHA-256 \`$SHA256\`)" \
+              "- Corresponding sources: \`$SOURCES_ARCHIVE\` ($SOURCES_SIZE bytes, SHA-256 \`$SOURCES_SHA256\`)" \
+              "Exact upstream sources, immutable Alpine aports commits, and licenses are listed in \`SOURCES\`.")"
+            gh release create "$TAG" dist/* --title "VM Assets v$VERSION" --notes "$notes"
           fi
