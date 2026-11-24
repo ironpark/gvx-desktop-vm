@@ -350,18 +350,15 @@ func agentContainerNetUpdate(ctx context.Context, vm vmInstance, cfg guestproto.
 }
 
 // watchContextClose closes conn if ctx is canceled before the returned stop
-// function is called, unblocking Read/Write calls.
+// function is called, unblocking Read/Write calls. Uses context.AfterFunc so
+// calling stop() synchronously guarantees conn will not be closed if ctx is
+// canceled immediately afterwards.
 func watchContextClose(ctx context.Context, conn net.Conn) func() {
 	if ctx.Done() == nil {
 		return func() {}
 	}
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = conn.Close()
-		case <-done:
-		}
-	}()
-	return func() { close(done) }
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+	})
+	return func() { stop() }
 }

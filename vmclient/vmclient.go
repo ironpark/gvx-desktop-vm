@@ -467,15 +467,10 @@ func watchContextClose(ctx context.Context, conn net.Conn) func() {
 	if ctx.Done() == nil {
 		return func() {}
 	}
-	done := make(chan struct{})
-	go func() {
-		select {
-		case <-ctx.Done():
-			_ = conn.Close()
-		case <-done:
-		}
-	}()
-	return func() { close(done) }
+	stop := context.AfterFunc(ctx, func() {
+		_ = conn.Close()
+	})
+	return func() { stop() }
 }
 
 type closeWriter interface {
