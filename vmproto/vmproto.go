@@ -55,6 +55,9 @@ const (
 	// FeatureContainers indicates the helper supports VMSpec.Shares,
 	// VMSpec.ExtraDisks, and the container-* ops.
 	FeatureContainers = guestproto.FeatureContainers
+	// FeatureOverlay indicates the helper supports container-net-stream and
+	// container-net-update for Compose overlay networking.
+	FeatureOverlay = guestproto.FeatureOverlay
 )
 
 // The ops.
@@ -81,19 +84,21 @@ const (
 
 	// Container ops (advertised via FeatureContainers), proxied between the
 	// control socket and the guest agent.
-	OpContainerStart    = guestproto.OpContainerStart
-	OpContainerAttach   = guestproto.OpContainerAttach
-	OpContainerSignal   = guestproto.OpContainerSignal
-	OpContainerResize   = guestproto.OpContainerResize
-	OpContainerExec     = guestproto.OpContainerExec
-	OpContainerTop      = guestproto.OpContainerTop
-	OpContainerStats    = guestproto.OpContainerStats
-	OpContainerPause    = guestproto.OpContainerPause
-	OpContainerUnpause  = guestproto.OpContainerUnpause
-	OpContainerStat     = guestproto.OpContainerStat
-	OpContainerCopyFrom = guestproto.OpContainerCopyFrom
-	OpContainerCopyTo   = guestproto.OpContainerCopyTo
-	OpContainerExport   = guestproto.OpContainerExport
+	OpContainerStart     = guestproto.OpContainerStart
+	OpContainerAttach    = guestproto.OpContainerAttach
+	OpContainerSignal    = guestproto.OpContainerSignal
+	OpContainerResize    = guestproto.OpContainerResize
+	OpContainerExec      = guestproto.OpContainerExec
+	OpContainerTop       = guestproto.OpContainerTop
+	OpContainerStats     = guestproto.OpContainerStats
+	OpContainerPause     = guestproto.OpContainerPause
+	OpContainerUnpause   = guestproto.OpContainerUnpause
+	OpContainerStat      = guestproto.OpContainerStat
+	OpContainerCopyFrom  = guestproto.OpContainerCopyFrom
+	OpContainerCopyTo    = guestproto.OpContainerCopyTo
+	OpContainerExport    = guestproto.OpContainerExport
+	OpContainerNetStream = guestproto.OpContainerNetStream
+	OpContainerNetUpdate = guestproto.OpContainerNetUpdate
 )
 
 // Codes, for a response with OK false.
@@ -123,13 +128,14 @@ type Request struct {
 	Stop  *StopRequest  `json:"stop,omitempty"`
 	Dial  *DialRequest  `json:"dial,omitempty"`
 
-	// Container op payloads (FeatureContainers).
+	// Container op payloads (FeatureContainers / FeatureOverlay).
 	Container       *ContainerSpec          `json:"container,omitempty"`
 	ContainerExec   *ContainerExecRequest   `json:"containerExec,omitempty"`
 	ContainerSignal *ContainerSignalRequest `json:"containerSignal,omitempty"`
 	ContainerResize *ContainerResizeRequest `json:"containerResize,omitempty"`
 	ContainerCopy   *ContainerCopyRequest   `json:"containerCopy,omitempty"`
 	ContainerExport *ContainerExportRequest `json:"containerExport,omitempty"`
+	ContainerNet    *ContainerNetConfig     `json:"containerNet,omitempty"`
 }
 
 // Response answers a request.
@@ -297,6 +303,7 @@ type (
 	ContainerStats         = guestproto.ContainerStats
 	ContainerPathStat      = guestproto.ContainerPathStat
 	ContainerExit          = guestproto.Exit
+	ContainerNetConfig     = guestproto.ContainerNetConfig
 )
 
 // DiskSpec is a raw disk image on the host.

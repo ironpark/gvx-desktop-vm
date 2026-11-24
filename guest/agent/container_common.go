@@ -95,6 +95,8 @@ type containerOps interface {
 	CopyFrom(req guestproto.ContainerCopyRequest) (guestproto.ContainerPathStat, func(w io.Writer) error, error)
 	CopyTo(req guestproto.ContainerCopyRequest) (func(r io.Reader) error, error)
 	Export(req guestproto.ContainerExportRequest) (func(w io.Writer) error, error)
+	NetAttach(cfg guestproto.ContainerNetConfig) (overlayNetSession, error)
+	NetUpdate(cfg guestproto.ContainerNetConfig) error
 	Shutdown(timeout time.Duration) error
 }
 

@@ -504,6 +504,8 @@ type fakeContainerOps struct {
 	execProcFn    func(req guestproto.ContainerExecRequest) (containerExecProc, error)
 	rootfsDir     string
 	shutdownCalls atomic.Int32
+	netAttachFn   func(cfg guestproto.ContainerNetConfig) (overlayNetSession, error)
+	netUpdateFn   func(cfg guestproto.ContainerNetConfig) error
 }
 
 func newFakeContainerOps(t *testing.T) *fakeContainerOps {
@@ -660,6 +662,20 @@ func (f *fakeContainerOps) Export(req guestproto.ContainerExportRequest) (func(i
 	return func(w io.Writer) error {
 		return writeTarFromPath(f.rootfsDir, false, req.UpperOnly, false, w)
 	}, nil
+}
+
+func (f *fakeContainerOps) NetAttach(cfg guestproto.ContainerNetConfig) (overlayNetSession, error) {
+	if f.netAttachFn != nil {
+		return f.netAttachFn(cfg)
+	}
+	return nil, errWithCode(guestproto.CodeFailed, errors.New("overlay not configured in fake"))
+}
+
+func (f *fakeContainerOps) NetUpdate(cfg guestproto.ContainerNetConfig) error {
+	if f.netUpdateFn != nil {
+		return f.netUpdateFn(cfg)
+	}
+	return errWithCode(guestproto.CodeNotRunning, errors.New("overlay not attached"))
 }
 
 func (f *fakeContainerOps) Shutdown(timeout time.Duration) error {

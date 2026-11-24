@@ -3,6 +3,7 @@ package vmclient
 import (
 	"bufio"
 	"context"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -263,6 +264,70 @@ func (c *Client) ContainerExport(ctx context.Context, req vmproto.ContainerExpor
 		return nil, err
 	}
 	return &frameDataReader{conn: conn, br: br}, nil
+}
+
+// ContainerNetAttach opens the bidirectional overlay network & DNS relay
+// stream (gvx0 TUN + 127.0.0.11:53) inside the guest. ctx bounds opening the
+// stream; callers own the returned stream's lifecycle via Close.
+func (c *Client) ContainerNetAttach(ctx context.Context, cfg vmproto.ContainerNetConfig) (*ContainerNetStream, error) {
+	conn, br, _, err := c.openStream(ctx, vmproto.Request{
+		Op:           vmproto.OpContainerNetStream,
+		ContainerNet: &cfg,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return &ContainerNetStream{conn: conn, br: br}, nil
+}
+
+// ContainerNetUpdate reconciles gvx0's addresses and routes on a running
+// micro-VM container (for live docker network connect/disconnect).
+func (c *Client) ContainerNetUpdate(ctx context.Context, cfg vmproto.ContainerNetConfig) error {
+	_, err := c.roundTrip(ctx, vmproto.Request{
+		Op:           vmproto.OpContainerNetUpdate,
+		ContainerNet: &cfg,
+	})
+	return err
+}
+
+// ContainerNetStream is a live bidirectional overlay network and DNS relay
+// session returned by ContainerNetAttach.
+type ContainerNetStream struct {
+	conn      net.Conn
+	br        *bufio.Reader
+	writeMu   sync.Mutex
+	closeOnce sync.Once
+	closeErr  error
+}
+
+// ReadFrame reads the next guest->host frame (FrameNetPacket or FrameDNSQuery).
+func (s *ContainerNetStream) ReadFrame() (kind byte, payload []byte, err error) {
+	return guestproto.ReadFrame(s.br)
+}
+
+// SendPacket delivers a raw IPv4 packet to the guest's gvx0 TUN interface.
+func (s *ContainerNetStream) SendPacket(pkt []byte) error {
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return guestproto.WriteFrame(s.conn, guestproto.FrameNetPacket, pkt)
+}
+
+// SendDNSReply delivers a raw DNS wire reply correlated with seq to the guest.
+func (s *ContainerNetStream) SendDNSReply(seq uint32, reply []byte) error {
+	buf := make([]byte, 4+len(reply))
+	binary.BigEndian.PutUint32(buf[0:4], seq)
+	copy(buf[4:], reply)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	return guestproto.WriteFrame(s.conn, guestproto.FrameDNSReply, buf)
+}
+
+// Close closes the overlay network stream and tears down the guest's tunnel.
+func (s *ContainerNetStream) Close() error {
+	s.closeOnce.Do(func() {
+		s.closeErr = s.conn.Close()
+	})
+	return s.closeErr
 }
 
 func (c *Client) openStream(ctx context.Context, req vmproto.Request) (net.Conn, *bufio.Reader, vmproto.Response, error) {

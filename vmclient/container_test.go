@@ -251,6 +251,26 @@ func (s *fakeContainerServer) handle(conn net.Conn) {
 		_ = vmproto.WriteLine(conn, vmproto.Response{OK: true})
 		_ = guestproto.WriteFrame(conn, guestproto.FrameData, []byte("export-tar-bytes"))
 		_ = guestproto.WriteFrame(conn, guestproto.FrameEOF, nil)
+	case vmproto.OpContainerNetStream:
+		if req.ContainerNet == nil {
+			_ = vmproto.WriteLine(conn, vmproto.Response{OK: false, Code: vmproto.CodeBadRequest, Error: "missing containerNet"})
+			return
+		}
+		_ = vmproto.WriteLine(conn, vmproto.Response{OK: true})
+		// Echo back packets and DNS replies as frames so client methods are verified.
+		for {
+			kind, payload, err := guestproto.ReadFrame(br)
+			if err != nil {
+				return
+			}
+			_ = guestproto.WriteFrame(conn, kind, payload)
+		}
+	case vmproto.OpContainerNetUpdate:
+		if req.ContainerNet == nil {
+			_ = vmproto.WriteLine(conn, vmproto.Response{OK: false, Code: vmproto.CodeBadRequest, Error: "missing containerNet"})
+			return
+		}
+		_ = vmproto.WriteLine(conn, vmproto.Response{OK: true})
 	default:
 		_ = vmproto.WriteLine(conn, vmproto.Response{OK: false, Code: vmproto.CodeUnknownOp})
 	}
@@ -489,5 +509,41 @@ func TestClientContainerMethods(t *testing.T) {
 	srv.mu.Unlock()
 	if !upperHit {
 		t.Fatal("expected UpperOnly=true on export")
+	}
+
+	// ContainerNetAttach & ContainerNetUpdate.
+	netStream, err := client.ContainerNetAttach(ctx, vmproto.ContainerNetConfig{
+		Addresses: []string{"10.89.1.2/24"},
+		Routes:    []string{"10.89.0.0/16"},
+		MTU:       60000,
+		DNS:       true,
+	})
+	if err != nil {
+		t.Fatalf("ContainerNetAttach: %v", err)
+	}
+	pkt := make([]byte, 24)
+	pkt[0] = 0x45
+	if err := netStream.SendPacket(pkt); err != nil {
+		t.Fatalf("SendPacket: %v", err)
+	}
+	kind, gotPkt, err := netStream.ReadFrame()
+	if err != nil || kind != guestproto.FrameNetPacket || !bytes.Equal(gotPkt, pkt) {
+		t.Fatalf("ReadFrame pkt = (%d, %x, %v)", kind, gotPkt, err)
+	}
+	if err := netStream.SendDNSReply(99, []byte{0xde, 0xad}); err != nil {
+		t.Fatalf("SendDNSReply: %v", err)
+	}
+	kind, gotDNS, err := netStream.ReadFrame()
+	if err != nil || kind != guestproto.FrameDNSReply || !bytes.Equal(gotDNS, []byte{0, 0, 0, 99, 0xde, 0xad}) {
+		t.Fatalf("ReadFrame dns = (%d, %x, %v)", kind, gotDNS, err)
+	}
+	if err := client.ContainerNetUpdate(ctx, vmproto.ContainerNetConfig{
+		Addresses: []string{"10.89.1.2/24", "10.89.2.2/24"},
+		Routes:    []string{"10.89.0.0/16"},
+	}); err != nil {
+		t.Fatalf("ContainerNetUpdate: %v", err)
+	}
+	if err := netStream.Close(); err != nil {
+		t.Fatalf("netStream.Close: %v", err)
 	}
 }

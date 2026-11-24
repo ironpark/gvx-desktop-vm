@@ -36,6 +36,7 @@ type fakeContainerVM struct {
 	copyToFailMsg  string
 	copyFromErrMsg string
 	exportReqs     []guestproto.ContainerExportRequest
+	netUpdates     []guestproto.ContainerNetConfig
 }
 
 func newFakeContainerVM(cfg vz.Config) *fakeContainerVM {
@@ -327,6 +328,30 @@ func (f *fakeContainerVM) serveContainerAgent(conn net.Conn) {
 		}
 		_ = guestproto.WriteFrame(conn, guestproto.FrameData, []byte("export-"+tag))
 		_ = guestproto.WriteFrame(conn, guestproto.FrameEOF, nil)
+	case guestproto.OpContainerNetStream:
+		if req.ContainerNet == nil {
+			_ = vmproto.WriteLine(conn, guestproto.Response{OK: false, Code: guestproto.CodeBadRequest, Error: "missing containerNet"})
+			return
+		}
+		if err := vmproto.WriteLine(conn, guestproto.Response{OK: true}); err != nil {
+			return
+		}
+		for {
+			kind, payload, err := guestproto.ReadFrame(br)
+			if err != nil {
+				return
+			}
+			_ = guestproto.WriteFrame(conn, kind, payload)
+		}
+	case guestproto.OpContainerNetUpdate:
+		if req.ContainerNet == nil {
+			_ = vmproto.WriteLine(conn, guestproto.Response{OK: false, Code: guestproto.CodeBadRequest, Error: "missing containerNet"})
+			return
+		}
+		f.ctrMu.Lock()
+		f.netUpdates = append(f.netUpdates, *req.ContainerNet)
+		f.ctrMu.Unlock()
+		_ = vmproto.WriteLine(conn, guestproto.Response{OK: true})
 	default:
 		_ = vmproto.WriteLine(conn, guestproto.Response{OK: false, Code: guestproto.CodeUnknownOp, Error: "unknown op"})
 	}
@@ -795,6 +820,53 @@ func TestServerContainerOpsProxyAndExecCLI(t *testing.T) {
 	_ = expConn.Close()
 	if expData.String() != "export-upper" {
 		t.Fatalf("export data = %q", expData.String())
+	}
+
+	// ContainerNetStream & ContainerNetUpdate through vmhelper proxy.
+	netConn, err := net.Dial("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = vmproto.WriteLine(netConn, vmproto.Request{
+		V:  vmproto.Version,
+		Op: vmproto.OpContainerNetStream,
+		ContainerNet: &vmproto.ContainerNetConfig{
+			Addresses: []string{"10.89.1.2/24"},
+			Routes:    []string{"10.89.0.0/16"},
+			DNS:       true,
+		},
+	})
+	netBr := bufio.NewReader(netConn)
+	var netResp vmproto.Response
+	if err := vmproto.ReadLine(netBr, &netResp); err != nil || !netResp.OK {
+		t.Fatalf("net-stream handshake: resp=%+v err=%v", netResp, err)
+	}
+	pkt := make([]byte, 24)
+	pkt[0] = 0x45
+	_ = guestproto.WriteFrame(netConn, guestproto.FrameNetPacket, pkt)
+	kind, payload, err = guestproto.ReadFrame(netBr)
+	if err != nil || kind != guestproto.FrameNetPacket || !bytes.Equal(payload, pkt) {
+		t.Fatalf("net-stream echo = (%d, %x, %v)", kind, payload, err)
+	}
+	updResp := sendReq(t, sock, vmproto.Request{
+		V:  vmproto.Version,
+		Op: vmproto.OpContainerNetUpdate,
+		ContainerNet: &vmproto.ContainerNetConfig{
+			Addresses: []string{"10.89.1.2/24", "10.89.2.2/24"},
+			Routes:    []string{"10.89.0.0/16"},
+		},
+	})
+	if !updResp.OK {
+		t.Fatalf("net-update = %+v", updResp)
+	}
+	_ = netConn.Close()
+	vmMu.Lock()
+	fvm.ctrMu.Lock()
+	gotUpdates := len(fvm.netUpdates)
+	fvm.ctrMu.Unlock()
+	vmMu.Unlock()
+	if gotUpdates != 1 {
+		t.Fatalf("netUpdates = %d, want 1", gotUpdates)
 	}
 
 	// Verify active container-exec stream is torn down cleanly on OpStop.

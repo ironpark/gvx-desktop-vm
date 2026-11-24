@@ -49,6 +49,7 @@ type linuxContainerOps struct {
 	innerMounts  []string
 	rootfsUp     bool
 	cgroupActive bool
+	overlay      *linuxOverlaySession
 }
 
 func defaultContainerOps() containerOps {
@@ -600,6 +601,9 @@ func (c *linuxContainerOps) setupSpecialAndUserMounts(spec guestproto.ContainerS
 	}
 
 	resolvContent, gatewayIP := waitForNetworkConfig(1500 * time.Millisecond)
+	if spec.Network != nil && spec.Network.DNS {
+		resolvContent = "nameserver " + overlayDNSIP + "\n"
+	}
 	hostname := spec.Hostname
 	if hostname == "" {
 		hostname = "localhost"
@@ -1636,6 +1640,48 @@ func (c *linuxContainerOps) Export(req guestproto.ContainerExportRequest) (func(
 	}, nil
 }
 
+func (c *linuxContainerOps) NetAttach(cfg guestproto.ContainerNetConfig) (overlayNetSession, error) {
+	c.mu.Lock()
+	if c.overlay != nil {
+		c.mu.Unlock()
+		return nil, errWithCode(guestproto.CodeFailed, errors.New("overlay network already attached"))
+	}
+	c.mu.Unlock()
+
+	var sess *linuxOverlaySession
+	var err error
+	sess, err = startLinuxOverlaySession(cfg, func(closed *linuxOverlaySession) {
+		c.mu.Lock()
+		if c.overlay == closed {
+			c.overlay = nil
+		}
+		c.mu.Unlock()
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	c.mu.Lock()
+	if c.overlay != nil {
+		c.mu.Unlock()
+		_ = sess.Close()
+		return nil, errWithCode(guestproto.CodeFailed, errors.New("overlay network already attached"))
+	}
+	c.overlay = sess
+	c.mu.Unlock()
+	return sess, nil
+}
+
+func (c *linuxContainerOps) NetUpdate(cfg guestproto.ContainerNetConfig) error {
+	c.mu.Lock()
+	sess := c.overlay
+	c.mu.Unlock()
+	if sess == nil {
+		return errWithCode(guestproto.CodeNotRunning, errors.New("overlay network is not attached"))
+	}
+	return sess.Update(cfg)
+}
+
 func (c *linuxContainerOps) Shutdown(timeout time.Duration) error {
 	c.mu.Lock()
 	started := c.started
@@ -1646,6 +1692,13 @@ func (c *linuxContainerOps) Shutdown(timeout time.Duration) error {
 	c.mu.Unlock()
 
 	if !started {
+		c.mu.Lock()
+		ovl := c.overlay
+		c.overlay = nil
+		c.mu.Unlock()
+		if ovl != nil {
+			_ = ovl.Close()
+		}
 		return nil
 	}
 
@@ -1682,13 +1735,19 @@ func (c *linuxContainerOps) cleanupResources() {
 	loops := append([]string(nil), c.loopDevs...)
 	rootfsUp := c.rootfsUp
 	cgActive := c.cgroupActive
+	ovl := c.overlay
 	c.innerMounts = nil
 	c.volMounts = nil
 	c.layerMounts = nil
 	c.loopDevs = nil
 	c.rootfsUp = false
 	c.cgroupActive = false
+	c.overlay = nil
 	c.mu.Unlock()
+
+	if ovl != nil {
+		_ = ovl.Close()
+	}
 
 	// Kill any stragglers still in the container cgroup.
 	if cgActive {

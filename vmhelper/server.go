@@ -237,6 +237,10 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.handleContainerCopyTo(conn, br, req.ContainerCopy)
 	case vmproto.OpContainerExport:
 		s.handleContainerExport(conn, br, req.ContainerExport)
+	case vmproto.OpContainerNetStream:
+		s.handleContainerNetStream(conn, br, req.ContainerNet)
+	case vmproto.OpContainerNetUpdate:
+		s.handleContainerNetUpdate(conn, req.ContainerNet)
 	default:
 		_ = vmproto.WriteLine(conn, vmproto.Response{
 			OK:    false,
@@ -254,7 +258,7 @@ func (s *Server) handleHello(conn net.Conn) {
 			MinProtocol: vmproto.Version,
 			Helper:      s.opts.helperVersion,
 			PID:         os.Getpid(),
-			Features:    []string{vmproto.FeatureContainers},
+			Features:    []string{vmproto.FeatureContainers, vmproto.FeatureOverlay},
 		},
 	})
 }
@@ -1175,6 +1179,60 @@ func (s *Server) handleContainerExport(conn net.Conn, br *bufio.Reader, req *vmp
 		return
 	}
 	s.proxyContainerStream(conn, br, guestConn, vmproto.Response{})
+}
+
+func (s *Server) handleContainerNetStream(conn net.Conn, br *bufio.Reader, req *vmproto.ContainerNetConfig) {
+	if req == nil {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  vmproto.CodeBadRequest,
+			Error: "container-net-stream requires containerNet config",
+		})
+		return
+	}
+	vm, ok := s.runningVM(conn)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.srvCtx, defaultContainerOpTimeout)
+	guestConn, err := agentContainerNetStream(ctx, vm, *req)
+	cancel()
+	if err != nil {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  errCodeFor(err),
+			Error: err.Error(),
+		})
+		return
+	}
+	s.proxyContainerStream(conn, br, guestConn, vmproto.Response{})
+}
+
+func (s *Server) handleContainerNetUpdate(conn net.Conn, req *vmproto.ContainerNetConfig) {
+	if req == nil {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  vmproto.CodeBadRequest,
+			Error: "container-net-update requires containerNet config",
+		})
+		return
+	}
+	vm, ok := s.runningVM(conn)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.srvCtx, defaultContainerOpTimeout)
+	err := agentContainerNetUpdate(ctx, vm, *req)
+	cancel()
+	if err != nil {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  errCodeFor(err),
+			Error: err.Error(),
+		})
+		return
+	}
+	_ = vmproto.WriteLine(conn, vmproto.Response{OK: true})
 }
 
 func (s *Server) handleEvents(conn net.Conn, br *bufio.Reader) {

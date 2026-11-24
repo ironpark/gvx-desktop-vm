@@ -52,6 +52,9 @@ const (
 	// FeatureContainers indicates the agent supports the container-* ops and
 	// FrameResize/FrameData/FrameEOF extensions.
 	FeatureContainers = "containers"
+	// FeatureOverlay indicates the agent supports the container-net-stream and
+	// container-net-update ops (gvx0 TUN + 127.0.0.11:53 DNS relay over vsock).
+	FeatureOverlay = "overlay"
 )
 
 // The virtiofs tags the host shares and the guest mounts at /mnt/<tag>.
@@ -140,6 +143,16 @@ const (
 	// OpContainerExport streams a tar archive of Request.ContainerExport
 	// (full rootfs or upperOnly) as FrameData frames terminated by FrameEOF.
 	OpContainerExport = "container-export"
+
+	// Overlay network ops (advertised via FeatureOverlay).
+	//
+	// OpContainerNetStream configures gvx0 (TUN) and 127.0.0.11:53 (DNS) using
+	// Request.ContainerNet and upgrades the connection to a bidirectional
+	// FrameNetPacket / FrameDNSQuery / FrameDNSReply stream.
+	OpContainerNetStream = "container-net-stream"
+	// OpContainerNetUpdate reconciles gvx0's addresses and routes on a running
+	// container using Request.ContainerNet (live network connect/disconnect).
+	OpContainerNetUpdate = "container-net-update"
 )
 
 // Codes, for a response with OK false.
@@ -165,13 +178,14 @@ type Request struct {
 	Disk    *DiskRequest    `json:"disk,omitempty"`
 	Service *ServiceRequest `json:"service,omitempty"`
 
-	// Container op payloads (FeatureContainers).
+	// Container op payloads (FeatureContainers / FeatureOverlay).
 	Container       *ContainerSpec          `json:"container,omitempty"`
 	ContainerExec   *ContainerExecRequest   `json:"containerExec,omitempty"`
 	ContainerSignal *ContainerSignalRequest `json:"containerSignal,omitempty"`
 	ContainerResize *ContainerResizeRequest `json:"containerResize,omitempty"`
 	ContainerCopy   *ContainerCopyRequest   `json:"containerCopy,omitempty"`
 	ContainerExport *ContainerExportRequest `json:"containerExport,omitempty"`
+	ContainerNet    *ContainerNetConfig     `json:"containerNet,omitempty"`
 }
 
 // Response answers a request.
@@ -266,24 +280,42 @@ type ServiceStatus struct {
 
 // ContainerSpec describes the single container run inside a micro-VM.
 type ContainerSpec struct {
-	Argv           []string         `json:"argv"`
-	Env            []string         `json:"env,omitempty"`
-	Workdir        string           `json:"workdir,omitempty"`
-	User           string           `json:"user,omitempty"`
-	Hostname       string           `json:"hostname,omitempty"`
-	ExtraHosts     []string         `json:"extraHosts,omitempty"`
-	TTY            bool             `json:"tty,omitempty"`
-	Interactive    bool             `json:"interactive,omitempty"`
-	Rows           uint16           `json:"rows,omitempty"`
-	Cols           uint16           `json:"cols,omitempty"`
-	Privileged     bool             `json:"privileged,omitempty"`
-	ReadonlyRootfs bool             `json:"readonlyRootfs,omitempty"`
-	MemoryMax      int64            `json:"memoryMax,omitempty"`
-	CPUQuota       int64            `json:"cpuQuota,omitempty"`
-	CPUPeriod      int64            `json:"cpuPeriod,omitempty"`
-	PidsLimit      int64            `json:"pidsLimit,omitempty"`
-	Layers         []LayerSource    `json:"layers"`
-	Mounts         []ContainerMount `json:"mounts,omitempty"`
+	Argv           []string            `json:"argv"`
+	Env            []string            `json:"env,omitempty"`
+	Workdir        string              `json:"workdir,omitempty"`
+	User           string              `json:"user,omitempty"`
+	Hostname       string              `json:"hostname,omitempty"`
+	ExtraHosts     []string            `json:"extraHosts,omitempty"`
+	TTY            bool                `json:"tty,omitempty"`
+	Interactive    bool                `json:"interactive,omitempty"`
+	Rows           uint16              `json:"rows,omitempty"`
+	Cols           uint16              `json:"cols,omitempty"`
+	Privileged     bool                `json:"privileged,omitempty"`
+	ReadonlyRootfs bool                `json:"readonlyRootfs,omitempty"`
+	MemoryMax      int64               `json:"memoryMax,omitempty"`
+	CPUQuota       int64               `json:"cpuQuota,omitempty"`
+	CPUPeriod      int64               `json:"cpuPeriod,omitempty"`
+	PidsLimit      int64               `json:"pidsLimit,omitempty"`
+	Layers         []LayerSource       `json:"layers"`
+	Mounts         []ContainerMount    `json:"mounts,omitempty"`
+	Network        *ContainerNetConfig `json:"network,omitempty"`
+}
+
+// ContainerNetConfig describes a micro-VM container's overlay network link
+// (gvx0 TUN) and embedded DNS relay (127.0.0.11:53).
+type ContainerNetConfig struct {
+	// Addresses are IPv4 CIDR prefixes configured on gvx0 (e.g. "10.89.1.2/24").
+	// Empty brings gvx0 down (when disconnected from all user networks).
+	Addresses []string `json:"addresses,omitempty"`
+	// Routes are additional IPv4 CIDR prefixes routed via gvx0 (e.g. "10.89.0.0/16").
+	Routes []string `json:"routes,omitempty"`
+	// MTU is gvx0's MTU (0 defaults to 1420).
+	MTU int `json:"mtu,omitempty"`
+	// Isolated indicates the container is only on internal networks (no internet).
+	Isolated bool `json:"isolated,omitempty"`
+	// DNS enables the guest-local 127.0.0.11:53 UDP/TCP relay and writes
+	// "nameserver 127.0.0.11" into the container's /etc/resolv.conf.
+	DNS bool `json:"dns,omitempty"`
 }
 
 // LayerSource identifies one read-only EROFS image layer inside the guest,
@@ -407,14 +439,17 @@ type ContainerPathStat struct {
 
 // The kinds of frame of an exec or container stream.
 const (
-	FrameStdout   byte = 1
-	FrameStderr   byte = 2
-	FrameExit     byte = 3
-	FrameStdin    byte = 4
-	FrameStdinEOF byte = 5
-	FrameResize   byte = 6 // payload: JSON ContainerResizeRequest
-	FrameData     byte = 7 // payload: raw stream chunk (copy-from, copy-to, export)
-	FrameEOF      byte = 8 // payload: empty on clean EOF, or UTF-8 error message
+	FrameStdout    byte = 1
+	FrameStderr    byte = 2
+	FrameExit      byte = 3
+	FrameStdin     byte = 4
+	FrameStdinEOF  byte = 5
+	FrameResize    byte = 6  // payload: JSON ContainerResizeRequest
+	FrameData      byte = 7  // payload: raw stream chunk (copy-from, copy-to, export)
+	FrameEOF       byte = 8  // payload: empty on clean EOF, or UTF-8 error message
+	FrameNetPacket byte = 9  // payload: raw IPv4 packet (container-net-stream, bidirectional)
+	FrameDNSQuery  byte = 10 // payload: [4B big-endian seq][1B proto: 0=udp,1=tcp][raw DNS wire query]
+	FrameDNSReply  byte = 11 // payload: [4B big-endian seq][raw DNS wire reply]
 )
 
 // MaxFrame is the largest frame payload either side sends.

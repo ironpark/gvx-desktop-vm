@@ -66,6 +66,14 @@ func (unsupportedContainerOps) Export(guestproto.ContainerExportRequest) (func(i
 	return nil, errors.ErrUnsupported
 }
 
+func (unsupportedContainerOps) NetAttach(guestproto.ContainerNetConfig) (overlayNetSession, error) {
+	return nil, errors.ErrUnsupported
+}
+
+func (unsupportedContainerOps) NetUpdate(guestproto.ContainerNetConfig) error {
+	return errors.ErrUnsupported
+}
+
 func (unsupportedContainerOps) Shutdown(time.Duration) error { return nil }
 
 func isOverlayWhiteout(fs.FileInfo) bool { return false }

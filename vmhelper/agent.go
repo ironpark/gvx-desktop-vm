@@ -333,6 +333,22 @@ func agentContainerExport(ctx context.Context, vm vmInstance, req guestproto.Con
 	return conn, err
 }
 
+func agentContainerNetStream(ctx context.Context, vm vmInstance, cfg guestproto.ContainerNetConfig) (net.Conn, error) {
+	conn, _, err := agentOpenStream(ctx, vm, guestproto.Request{
+		Op:           guestproto.OpContainerNetStream,
+		ContainerNet: &cfg,
+	})
+	return conn, err
+}
+
+func agentContainerNetUpdate(ctx context.Context, vm vmInstance, cfg guestproto.ContainerNetConfig) error {
+	_, err := agentRoundTrip(ctx, vm, guestproto.Request{
+		Op:           guestproto.OpContainerNetUpdate,
+		ContainerNet: &cfg,
+	})
+	return err
+}
+
 // watchContextClose closes conn if ctx is canceled before the returned stop
 // function is called, unblocking Read/Write calls.
 func watchContextClose(ctx context.Context, conn net.Conn) func() {

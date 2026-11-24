@@ -204,6 +204,10 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 		s.handleContainerCopyTo(conn, br, req.ContainerCopy)
 	case guestproto.OpContainerExport:
 		s.handleContainerExport(conn, req.ContainerExport)
+	case guestproto.OpContainerNetStream:
+		s.handleContainerNetStream(conn, br, req.ContainerNet)
+	case guestproto.OpContainerNetUpdate:
+		s.handleContainerNetUpdate(conn, req.ContainerNet)
 	default:
 		_ = vmproto.WriteLine(conn, guestproto.Response{
 			OK:    false,
@@ -225,7 +229,7 @@ func (s *Server) handleHello(w io.Writer) {
 			Machine:     info.Machine,
 			Rosetta:     info.Rosetta,
 			Uptime:      info.Uptime,
-			Features:    []string{guestproto.FeatureContainers},
+			Features:    []string{guestproto.FeatureContainers, guestproto.FeatureOverlay},
 		},
 	})
 }
@@ -1111,6 +1115,52 @@ func (s *Server) handleContainerExport(conn io.ReadWriteCloser, req *guestproto.
 		return
 	}
 	streamTarResponse(conn, streamFn)
+}
+
+func (s *Server) handleContainerNetStream(conn io.ReadWriteCloser, br *bufio.Reader, req *guestproto.ContainerNetConfig) {
+	if req == nil {
+		_ = vmproto.WriteLine(conn, guestproto.Response{
+			OK:    false,
+			Code:  guestproto.CodeBadRequest,
+			Error: "containerNet config is required",
+		})
+		return
+	}
+	sess, err := s.ctr.NetAttach(*req)
+	if err != nil {
+		writeCodedError(conn, err)
+		return
+	}
+	if err := vmproto.WriteLine(conn, guestproto.Response{OK: true}); err != nil {
+		_ = sess.Close()
+		return
+	}
+	var writeMu sync.Mutex
+	writeFrame := func(kind byte, p []byte) error {
+		writeMu.Lock()
+		defer writeMu.Unlock()
+		return guestproto.WriteFrame(conn, kind, p)
+	}
+	readFrame := func() (byte, []byte, error) {
+		return guestproto.ReadFrame(br)
+	}
+	sess.Serve(readFrame, writeFrame, func() { _ = conn.Close() })
+}
+
+func (s *Server) handleContainerNetUpdate(w io.Writer, req *guestproto.ContainerNetConfig) {
+	if req == nil {
+		_ = vmproto.WriteLine(w, guestproto.Response{
+			OK:    false,
+			Code:  guestproto.CodeBadRequest,
+			Error: "containerNet config is required",
+		})
+		return
+	}
+	if err := s.ctr.NetUpdate(*req); err != nil {
+		writeCodedError(w, err)
+		return
+	}
+	_ = vmproto.WriteLine(w, guestproto.Response{OK: true})
 }
 
 func streamTarResponse(conn io.Writer, streamFn func(io.Writer) error) {
