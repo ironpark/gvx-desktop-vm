@@ -56,13 +56,13 @@ const ArchiveName = "gvx-vm-assets-v" + Version + "-arm64.tar.gz"
 // ReleaseURL is where ArchiveName is downloaded from.
 const ReleaseURL = "https://github.com/ironpark/gvx-desktop-vm/releases/download/" + ReleaseTag + "/" + ArchiveName
 
-// ArchiveSHA256 is the archive's SHA-256, hex. Empty until the vm-assets-v2
-// release is published and pinned from mkassets' reproducible build output.
-const ArchiveSHA256 = ""
+// ArchiveSHA256 is the archive's SHA-256, hex, pinned from the reproducible
+// vm-assets-v2 release.
+const ArchiveSHA256 = "33c017041da8a993fb4e791ea2e20ccebbe26af75f01b752dd986e68ee9b565b"
 
 // ArchiveSize is the archive's size in bytes, for progress and as a cap on
 // the download.
-const ArchiveSize int64 = 0
+const ArchiveSize int64 = 73587594
 
 // EnvOverride names the environment variable that points at a local asset
 // directory, for development.
