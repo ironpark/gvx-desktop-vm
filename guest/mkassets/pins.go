@@ -268,6 +268,7 @@ var aportsRecipes = []aportsRecipe{
 			{
 				Filename: "musl-1.2.6.tar.gz",
 				URL:      "https://musl.libc.org/releases/musl-1.2.6.tar.gz",
+				Mirrors:  []string{"https://distfiles.alpinelinux.org/distfiles/v3.24/musl-1.2.6.tar.gz"},
 				SHA512:   "1adad96eddb3a2eb0cacb3e363b0046568925fcdd75cf8b0503f2139df1f693d64730779ca0ce8131b7624ab2d37f4247bb1d3393c523de6e30d2b1d7732555c",
 			},
 		},
