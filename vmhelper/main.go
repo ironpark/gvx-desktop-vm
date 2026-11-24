@@ -12,7 +12,7 @@ import (
 // returns the process's exit code.
 func Main(args []string) int {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "vm helper: want serve, check or install-rosetta")
+		fmt.Fprintln(os.Stderr, "vm helper: want serve, exec, check or install-rosetta")
 		return 2
 	}
 	switch args[0] {
@@ -22,6 +22,8 @@ func Main(args []string) int {
 			return 1
 		}
 		return 0
+	case CmdExec:
+		return runExec(args[1:])
 	case CmdCheck, CmdInstallRosetta:
 		res := check(args[0] == CmdInstallRosetta)
 		_ = json.NewEncoder(os.Stdout).Encode(res)

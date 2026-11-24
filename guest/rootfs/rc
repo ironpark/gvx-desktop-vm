@@ -43,13 +43,18 @@ if [ -n "$assets" ]; then
 fi
 
 # Extra virtiofs shares, if the host asked for any (tag or tag:ro).
+set -f
 for s in $(echo "$shares" | tr , ' '); do
 	tag=${s%:ro}
+	case "$tag" in
+	"" | . | .. | */* | *[!A-Za-z0-9._-]*) continue ;;
+	esac
 	opt=rw
 	[ "$tag" != "$s" ] && opt=ro
 	mkdir -p "/mnt/$tag"
 	mount -t virtiofs -o "$opt" "$tag" "/mnt/$tag" || echo "rc: mount $tag failed"
 done
+set +f
 
 # Rosetta is a virtiofs share holding the translator. Register it with
 # binfmt_misc using flags C (credentials) and F (fix-binary), which opens

@@ -402,7 +402,7 @@ func TestFormatSourcesCompliance(t *testing.T) {
 		"Mozilla CA bundle",
 		"MPL-2.0",
 		"LICENSES/",
-		"gvx-vm-assets-v1-sources.tar.gz",
+		"gvx-vm-assets-v2-sources.tar.gz",
 	} {
 		if !strings.Contains(txt, want) {
 			t.Errorf("SOURCES missing %q", want)

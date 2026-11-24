@@ -45,7 +45,7 @@ import (
 
 // Version is the asset set's version. The release that carries it is
 // ReleaseTag; a new set (a kernel or buildkit bump) is a new Version.
-const Version = "1"
+const Version = "2"
 
 // ReleaseTag is the GitHub release of this repository with the archive.
 const ReleaseTag = "vm-assets-v" + Version
@@ -56,13 +56,13 @@ const ArchiveName = "gvx-vm-assets-v" + Version + "-arm64.tar.gz"
 // ReleaseURL is where ArchiveName is downloaded from.
 const ReleaseURL = "https://github.com/ironpark/gvx-desktop-vm/releases/download/" + ReleaseTag + "/" + ArchiveName
 
-// ArchiveSHA256 is the archive's SHA-256, hex: the vm-assets-v1 release,
-// built twice from empty caches with the same result.
-const ArchiveSHA256 = "14e5eef9049786f7a538ea4afc33b2b55760436c3da6bc7a70862798cd29c371"
+// ArchiveSHA256 is the archive's SHA-256, hex. Empty until the vm-assets-v2
+// release is published and pinned from mkassets' reproducible build output.
+const ArchiveSHA256 = ""
 
 // ArchiveSize is the archive's size in bytes, for progress and as a cap on
 // the download.
-const ArchiveSize int64 = 73102465
+const ArchiveSize int64 = 0
 
 // EnvOverride names the environment variable that points at a local asset
 // directory, for development.

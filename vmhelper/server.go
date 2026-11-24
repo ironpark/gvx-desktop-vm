@@ -20,13 +20,15 @@ import (
 )
 
 const (
-	defaultStopTimeout    = 15 * time.Second
-	defaultForceTimeout   = 5 * time.Second
-	defaultAgentReadyWait = 10 * time.Second
-	defaultAgentPollEvery = 5 * time.Millisecond
-	defaultServiceTimeout = 30 * time.Second
-	defaultDiskTimeout    = 30 * time.Second
-	defaultHelloTimeout   = 2 * time.Second
+	defaultStopTimeout        = 15 * time.Second
+	defaultForceTimeout       = 5 * time.Second
+	defaultAgentReadyWait     = 10 * time.Second
+	defaultAgentPollEvery     = 5 * time.Millisecond
+	defaultServiceTimeout     = 30 * time.Second
+	defaultDiskTimeout        = 30 * time.Second
+	defaultHelloTimeout       = 2 * time.Second
+	defaultContainerStartWait = 30 * time.Second
+	defaultContainerOpTimeout = 15 * time.Second
 )
 
 // vmInstance is the subset of *vz.VM that the helper server uses, extracted so
@@ -209,6 +211,32 @@ func (s *Server) handleConn(conn net.Conn) {
 		s.handleEvents(conn, br)
 	case vmproto.OpShutdown:
 		s.handleShutdown(conn, req.Stop)
+	case vmproto.OpContainerStart:
+		s.handleContainerStart(conn, req.Container)
+	case vmproto.OpContainerAttach:
+		s.handleContainerAttach(conn, br)
+	case vmproto.OpContainerSignal:
+		s.handleContainerSignal(conn, req.ContainerSignal)
+	case vmproto.OpContainerResize:
+		s.handleContainerResize(conn, req.ContainerResize)
+	case vmproto.OpContainerExec:
+		s.handleContainerExec(conn, br, req.ContainerExec)
+	case vmproto.OpContainerTop:
+		s.handleContainerTop(conn)
+	case vmproto.OpContainerStats:
+		s.handleContainerStats(conn)
+	case vmproto.OpContainerPause:
+		s.handleContainerPause(conn)
+	case vmproto.OpContainerUnpause:
+		s.handleContainerUnpause(conn)
+	case vmproto.OpContainerStat:
+		s.handleContainerStat(conn, req.ContainerCopy)
+	case vmproto.OpContainerCopyFrom:
+		s.handleContainerCopyFrom(conn, br, req.ContainerCopy)
+	case vmproto.OpContainerCopyTo:
+		s.handleContainerCopyTo(conn, br, req.ContainerCopy)
+	case vmproto.OpContainerExport:
+		s.handleContainerExport(conn, br, req.ContainerExport)
 	default:
 		_ = vmproto.WriteLine(conn, vmproto.Response{
 			OK:    false,
@@ -226,6 +254,7 @@ func (s *Server) handleHello(conn net.Conn) {
 			MinProtocol: vmproto.Version,
 			Helper:      s.opts.helperVersion,
 			PID:         os.Getpid(),
+			Features:    []string{vmproto.FeatureContainers},
 		},
 	})
 }
@@ -447,10 +476,23 @@ func (s *Server) bootVM(ctx context.Context, spec vmproto.VMSpec) (vmInstance, [
 			ReadOnly: true,
 		})
 	}
+	for _, sh := range spec.Shares {
+		vzCfg.Shares = append(vzCfg.Shares, vz.Share{
+			Tag:      sh.Tag,
+			Dir:      sh.Dir,
+			ReadOnly: sh.ReadOnly,
+		})
+	}
 	if spec.Disk != nil && spec.Disk.Path != "" {
 		vzCfg.Disks = append(vzCfg.Disks, vz.Disk{
 			Path:     spec.Disk.Path,
 			ReadOnly: false,
+		})
+	}
+	for _, ed := range spec.ExtraDisks {
+		vzCfg.Disks = append(vzCfg.Disks, vz.Disk{
+			Path:     ed.Path,
+			ReadOnly: ed.ReadOnly,
 		})
 	}
 
@@ -771,6 +813,370 @@ func (s *Server) handleDial(conn net.Conn, br *bufio.Reader, req *vmproto.DialRe
 	pipeBothWays(clientStream, conn, guestConn)
 }
 
+func (s *Server) runningVM(conn net.Conn) (vmInstance, bool) {
+	s.mu.Lock()
+	if s.shuttingDown {
+		s.mu.Unlock()
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  vmproto.CodeShutdown,
+			Error: "helper is shutting down",
+		})
+		return nil, false
+	}
+	vm := s.vm
+	running := s.status.State == vmproto.Running
+	s.mu.Unlock()
+
+	if !running || vm == nil {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  vmproto.CodeNotRunning,
+			Error: "VM is not running",
+		})
+		return nil, false
+	}
+	return vm, true
+}
+
+func (s *Server) proxyContainerStream(conn net.Conn, br *bufio.Reader, guestConn net.Conn, okResp vmproto.Response) {
+	defer guestConn.Close()
+	if !s.trackDialConns(conn, guestConn) {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  vmproto.CodeNotRunning,
+			Error: "VM stopped",
+		})
+		return
+	}
+	defer s.untrackDialConns(conn, guestConn)
+
+	okResp.OK = true
+	if err := vmproto.WriteLine(conn, okResp); err != nil {
+		return
+	}
+	pipeBothWays(newBufferedConn(conn, br), conn, guestConn)
+}
+
+func (s *Server) handleContainerStart(conn net.Conn, req *vmproto.ContainerSpec) {
+	if req == nil || len(req.Argv) == 0 {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  vmproto.CodeBadRequest,
+			Error: "container-start requires container spec with argv",
+		})
+		return
+	}
+	vm, ok := s.runningVM(conn)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.srvCtx, defaultContainerStartWait)
+	st, err := agentContainerStart(ctx, vm, *req)
+	cancel()
+	if err != nil {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  errCodeFor(err),
+			Error: err.Error(),
+		})
+		return
+	}
+	_ = vmproto.WriteLine(conn, vmproto.Response{
+		OK:        true,
+		Container: &st,
+	})
+}
+
+func (s *Server) handleContainerAttach(conn net.Conn, br *bufio.Reader) {
+	vm, ok := s.runningVM(conn)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.srvCtx, defaultContainerOpTimeout)
+	guestConn, st, err := agentContainerAttach(ctx, vm)
+	cancel()
+	if err != nil {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  errCodeFor(err),
+			Error: err.Error(),
+		})
+		return
+	}
+	s.proxyContainerStream(conn, br, guestConn, vmproto.Response{Container: st})
+}
+
+func (s *Server) handleContainerSignal(conn net.Conn, req *vmproto.ContainerSignalRequest) {
+	if req == nil {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  vmproto.CodeBadRequest,
+			Error: "container-signal requires signal request",
+		})
+		return
+	}
+	vm, ok := s.runningVM(conn)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.srvCtx, defaultContainerOpTimeout)
+	err := agentContainerSignal(ctx, vm, *req)
+	cancel()
+	if err != nil {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  errCodeFor(err),
+			Error: err.Error(),
+		})
+		return
+	}
+	_ = vmproto.WriteLine(conn, vmproto.Response{OK: true})
+}
+
+func (s *Server) handleContainerResize(conn net.Conn, req *vmproto.ContainerResizeRequest) {
+	if req == nil {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  vmproto.CodeBadRequest,
+			Error: "container-resize requires rows and cols",
+		})
+		return
+	}
+	vm, ok := s.runningVM(conn)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.srvCtx, defaultContainerOpTimeout)
+	err := agentContainerResize(ctx, vm, *req)
+	cancel()
+	if err != nil {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  errCodeFor(err),
+			Error: err.Error(),
+		})
+		return
+	}
+	_ = vmproto.WriteLine(conn, vmproto.Response{OK: true})
+}
+
+func (s *Server) handleContainerExec(conn net.Conn, br *bufio.Reader, req *vmproto.ContainerExecRequest) {
+	if req == nil || len(req.Argv) == 0 {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  vmproto.CodeBadRequest,
+			Error: "container-exec requires argv",
+		})
+		return
+	}
+	vm, ok := s.runningVM(conn)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.srvCtx, defaultContainerOpTimeout)
+	guestConn, pid, err := agentContainerExec(ctx, vm, *req)
+	cancel()
+	if err != nil {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  errCodeFor(err),
+			Error: err.Error(),
+		})
+		return
+	}
+	s.proxyContainerStream(conn, br, guestConn, vmproto.Response{ExecPID: pid})
+}
+
+func (s *Server) handleContainerTop(conn net.Conn) {
+	vm, ok := s.runningVM(conn)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.srvCtx, defaultContainerOpTimeout)
+	procs, err := agentContainerTop(ctx, vm)
+	cancel()
+	if err != nil {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  errCodeFor(err),
+			Error: err.Error(),
+		})
+		return
+	}
+	_ = vmproto.WriteLine(conn, vmproto.Response{
+		OK:        true,
+		Processes: procs,
+	})
+}
+
+func (s *Server) handleContainerStats(conn net.Conn) {
+	vm, ok := s.runningVM(conn)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.srvCtx, defaultContainerOpTimeout)
+	stats, err := agentContainerStats(ctx, vm)
+	cancel()
+	if err != nil {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  errCodeFor(err),
+			Error: err.Error(),
+		})
+		return
+	}
+	_ = vmproto.WriteLine(conn, vmproto.Response{
+		OK:    true,
+		Stats: &stats,
+	})
+}
+
+func (s *Server) handleContainerPause(conn net.Conn) {
+	vm, ok := s.runningVM(conn)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.srvCtx, defaultContainerOpTimeout)
+	err := agentContainerPause(ctx, vm)
+	cancel()
+	if err != nil {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  errCodeFor(err),
+			Error: err.Error(),
+		})
+		return
+	}
+	_ = vmproto.WriteLine(conn, vmproto.Response{OK: true})
+}
+
+func (s *Server) handleContainerUnpause(conn net.Conn) {
+	vm, ok := s.runningVM(conn)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.srvCtx, defaultContainerOpTimeout)
+	err := agentContainerUnpause(ctx, vm)
+	cancel()
+	if err != nil {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  errCodeFor(err),
+			Error: err.Error(),
+		})
+		return
+	}
+	_ = vmproto.WriteLine(conn, vmproto.Response{OK: true})
+}
+
+func (s *Server) handleContainerStat(conn net.Conn, req *vmproto.ContainerCopyRequest) {
+	if req == nil || req.Path == "" {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  vmproto.CodeBadRequest,
+			Error: "container-stat requires path",
+		})
+		return
+	}
+	vm, ok := s.runningVM(conn)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.srvCtx, defaultContainerOpTimeout)
+	ps, err := agentContainerStat(ctx, vm, *req)
+	cancel()
+	if err != nil {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  errCodeFor(err),
+			Error: err.Error(),
+		})
+		return
+	}
+	_ = vmproto.WriteLine(conn, vmproto.Response{
+		OK:       true,
+		PathStat: &ps,
+	})
+}
+
+func (s *Server) handleContainerCopyFrom(conn net.Conn, br *bufio.Reader, req *vmproto.ContainerCopyRequest) {
+	if req == nil || req.Path == "" {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  vmproto.CodeBadRequest,
+			Error: "container-copy-from requires path",
+		})
+		return
+	}
+	vm, ok := s.runningVM(conn)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.srvCtx, defaultContainerOpTimeout)
+	guestConn, ps, err := agentContainerCopyFrom(ctx, vm, *req)
+	cancel()
+	if err != nil {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  errCodeFor(err),
+			Error: err.Error(),
+		})
+		return
+	}
+	s.proxyContainerStream(conn, br, guestConn, vmproto.Response{PathStat: ps})
+}
+
+func (s *Server) handleContainerCopyTo(conn net.Conn, br *bufio.Reader, req *vmproto.ContainerCopyRequest) {
+	if req == nil || req.Path == "" {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  vmproto.CodeBadRequest,
+			Error: "container-copy-to requires path",
+		})
+		return
+	}
+	vm, ok := s.runningVM(conn)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.srvCtx, defaultContainerOpTimeout)
+	guestConn, err := agentContainerCopyTo(ctx, vm, *req)
+	cancel()
+	if err != nil {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  errCodeFor(err),
+			Error: err.Error(),
+		})
+		return
+	}
+	s.proxyContainerStream(conn, br, guestConn, vmproto.Response{})
+}
+
+func (s *Server) handleContainerExport(conn net.Conn, br *bufio.Reader, req *vmproto.ContainerExportRequest) {
+	var er vmproto.ContainerExportRequest
+	if req != nil {
+		er = *req
+	}
+	vm, ok := s.runningVM(conn)
+	if !ok {
+		return
+	}
+	ctx, cancel := context.WithTimeout(s.srvCtx, defaultContainerOpTimeout)
+	guestConn, err := agentContainerExport(ctx, vm, er)
+	cancel()
+	if err != nil {
+		_ = vmproto.WriteLine(conn, vmproto.Response{
+			OK:    false,
+			Code:  errCodeFor(err),
+			Error: err.Error(),
+		})
+		return
+	}
+	s.proxyContainerStream(conn, br, guestConn, vmproto.Response{})
+}
+
 func (s *Server) handleEvents(conn net.Conn, br *bufio.Reader) {
 	ch := make(chan vmproto.Event, 16)
 	s.mu.Lock()
@@ -965,7 +1371,47 @@ func validateSpec(spec vmproto.VMSpec) error {
 	if spec.MemoryMiB <= 0 {
 		return errors.New("spec.memoryMiB must be positive")
 	}
+	seenTags := make(map[string]struct{}, len(spec.Shares))
+	for _, sh := range spec.Shares {
+		if !isValidShareTag(sh.Tag) {
+			return fmt.Errorf("invalid share tag %q", sh.Tag)
+		}
+		if sh.Tag == guestproto.AssetsTag || sh.Tag == guestproto.RosettaTag {
+			return fmt.Errorf("share tag %q is reserved", sh.Tag)
+		}
+		if _, dup := seenTags[sh.Tag]; dup {
+			return fmt.Errorf("duplicate share tag %q", sh.Tag)
+		}
+		seenTags[sh.Tag] = struct{}{}
+		if strings.TrimSpace(sh.Dir) == "" {
+			return fmt.Errorf("share %q requires dir", sh.Tag)
+		}
+	}
+	for i, ed := range spec.ExtraDisks {
+		if strings.TrimSpace(ed.Path) == "" {
+			return fmt.Errorf("extraDisks[%d] requires path", i)
+		}
+	}
 	return nil
+}
+
+// isValidShareTag restricts virtiofs share tags to safe path and shell
+// characters ([A-Za-z0-9._-]), rejecting ".", "..", and leading "-".
+func isValidShareTag(tag string) bool {
+	if tag == "" || tag == "." || tag == ".." || tag[0] == '-' {
+		return false
+	}
+	for i := 0; i < len(tag); i++ {
+		c := tag[i]
+		ok := (c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') ||
+			c == '.' || c == '_' || c == '-'
+		if !ok {
+			return false
+		}
+	}
+	return true
 }
 
 func ensureDisk(path string, size int64) error {
@@ -1004,6 +1450,17 @@ func buildCommandLine(spec vmproto.VMSpec) string {
 	}
 	if spec.Network {
 		parts = append(parts, guestproto.CmdlineNet+"=1")
+	}
+	if len(spec.Shares) > 0 {
+		tags := make([]string, 0, len(spec.Shares))
+		for _, sh := range spec.Shares {
+			if sh.ReadOnly {
+				tags = append(tags, sh.Tag+":ro")
+			} else {
+				tags = append(tags, sh.Tag)
+			}
+		}
+		parts = append(parts, guestproto.CmdlineShares+"="+strings.Join(tags, ","))
 	}
 	if extra := strings.TrimSpace(spec.CommandLine); extra != "" {
 		parts = append(parts, extra)
@@ -1046,6 +1503,12 @@ func cloneSpec(s vmproto.VMSpec) vmproto.VMSpec {
 	if len(s.Services) > 0 {
 		cp.Services = append([]string(nil), s.Services...)
 	}
+	if len(s.Shares) > 0 {
+		cp.Shares = append([]vmproto.ShareSpec(nil), s.Shares...)
+	}
+	if len(s.ExtraDisks) > 0 {
+		cp.ExtraDisks = append([]vmproto.ExtraDiskSpec(nil), s.ExtraDisks...)
+	}
 	return cp
 }
 
@@ -1078,5 +1541,7 @@ func specsEqual(a, b vmproto.VMSpec) bool {
 	if a.Disk != nil && (a.Disk.Path != b.Disk.Path || a.Disk.Size != b.Disk.Size) {
 		return false
 	}
-	return slices.Equal(a.Services, b.Services)
+	return slices.Equal(a.Services, b.Services) &&
+		slices.Equal(a.Shares, b.Shares) &&
+		slices.Equal(a.ExtraDisks, b.ExtraDisks)
 }

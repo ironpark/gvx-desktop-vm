@@ -9,12 +9,17 @@ package main
 
 import (
 	"log"
+	"os"
 
 	"github.com/ironpark/gvx-desktop-vm/guestproto"
 	"github.com/ironpark/gvx-desktop-vm/vmassets"
 )
 
 func main() {
+	if len(os.Args) >= 2 && os.Args[1] == ctrInitArg {
+		runContainerInit()
+		return
+	}
 	log.SetPrefix("gvx-agent: ")
 	log.SetFlags(0)
 	ln, err := listenVsock(guestproto.AgentPort)

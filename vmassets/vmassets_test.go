@@ -146,6 +146,9 @@ func withTestRelease(t *testing.T, url, sha string, size int64) {
 }
 
 func TestAssetsNotPublished(t *testing.T) {
+	if Version != "2" || ReleaseTag != "vm-assets-v2" || ArchiveName != "gvx-vm-assets-v2-arm64.tar.gz" {
+		t.Fatalf("unexpected v2 constants: Version=%q ReleaseTag=%q ArchiveName=%q", Version, ReleaseTag, ArchiveName)
+	}
 	t.Setenv(EnvOverride, "")
 	withTestRelease(t, ReleaseURL, "", 0)
 

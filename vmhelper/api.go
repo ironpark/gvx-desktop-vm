@@ -26,6 +26,9 @@ const (
 	// output once it listens, and exits when standard input closes, after
 	// stopping the VM.
 	CmdServe = "serve"
+	// CmdExec connects to a running helper's control socket (-socket) and runs
+	// a command in its container, forwarding stdio and SIGWINCH resize events.
+	CmdExec = "exec"
 	// CmdCheck writes a CheckResult in JSON on standard output and exits.
 	CmdCheck = "check"
 	// CmdInstallRosetta asks macOS to install Rosetta (it shows its own

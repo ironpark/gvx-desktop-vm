@@ -56,4 +56,4 @@ Corresponding Source:
 For all GPL/LGPL/MPL-covered components, the complete corresponding source
 (upstream source tarballs verified against the pinned APKBUILD checksums,
 pinned Alpine aports recipes and patches, and BuildKit/runc source archives)
-is published alongside this release archive as gvx-vm-assets-v1-sources.tar.gz.
+is published alongside this release archive as gvx-vm-assets-v2-sources.tar.gz.

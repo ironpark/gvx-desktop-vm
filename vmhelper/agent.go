@@ -26,10 +26,24 @@ func (e *agentError) Error() string {
 }
 
 func (e *agentError) vmProtoCode() string {
-	if e.code == guestproto.CodeNoService {
+	switch e.code {
+	case guestproto.CodeNoService:
 		return vmproto.CodeNoService
+	case guestproto.CodeBadRequest:
+		return vmproto.CodeBadRequest
+	case guestproto.CodeNotFound:
+		return vmproto.CodeNotFound
+	case guestproto.CodeNotRunning:
+		return vmproto.CodeNotRunning
+	case guestproto.CodeAlreadyPaused:
+		return vmproto.CodeAlreadyPaused
+	case guestproto.CodeNotPaused:
+		return vmproto.CodeNotPaused
+	case guestproto.CodePaused:
+		return vmproto.CodePaused
+	default:
+		return vmproto.CodeGuest
 	}
-	return vmproto.CodeGuest
 }
 
 type closeWriter interface {
@@ -153,36 +167,170 @@ func agentShutdown(ctx context.Context, vm vmInstance) error {
 	return err
 }
 
-func agentDial(ctx context.Context, vm vmInstance, req guestproto.DialRequest) (net.Conn, error) {
+func agentOpenStream(ctx context.Context, vm vmInstance, req guestproto.Request) (net.Conn, guestproto.Response, error) {
 	conn, err := vm.Connect(ctx, guestproto.AgentPort)
 	if err != nil {
-		return nil, fmt.Errorf("vsock connect: %w", err)
+		return nil, guestproto.Response{}, fmt.Errorf("vsock connect: %w", err)
 	}
 	stopWatch := watchContextClose(ctx, conn)
 	defer stopWatch()
 
-	if err := vmproto.WriteLine(conn, guestproto.Request{
-		V:    guestproto.Version,
-		Op:   guestproto.OpDial,
-		Dial: &req,
-	}); err != nil {
+	req.V = guestproto.Version
+	if err := vmproto.WriteLine(conn, req); err != nil {
 		_ = conn.Close()
-		return nil, err
+		return nil, guestproto.Response{}, err
 	}
 	br := bufio.NewReader(conn)
 	var resp guestproto.Response
 	if err := vmproto.ReadLine(br, &resp); err != nil {
 		_ = conn.Close()
 		if ctx.Err() != nil {
-			return nil, ctx.Err()
+			return nil, guestproto.Response{}, ctx.Err()
 		}
-		return nil, err
+		return nil, guestproto.Response{}, err
 	}
 	if !resp.OK {
 		_ = conn.Close()
-		return nil, &agentError{code: resp.Code, msg: resp.Error}
+		return nil, resp, &agentError{code: resp.Code, msg: resp.Error}
 	}
-	return newBufferedConn(conn, br), nil
+	return newBufferedConn(conn, br), resp, nil
+}
+
+func agentDial(ctx context.Context, vm vmInstance, req guestproto.DialRequest) (net.Conn, error) {
+	conn, _, err := agentOpenStream(ctx, vm, guestproto.Request{
+		Op:   guestproto.OpDial,
+		Dial: &req,
+	})
+	return conn, err
+}
+
+func agentContainerStart(ctx context.Context, vm vmInstance, spec guestproto.ContainerSpec) (guestproto.ContainerState, error) {
+	resp, err := agentRoundTrip(ctx, vm, guestproto.Request{
+		Op:        guestproto.OpContainerStart,
+		Container: &spec,
+	})
+	if err != nil {
+		return guestproto.ContainerState{}, err
+	}
+	if resp.Container == nil {
+		return guestproto.ContainerState{}, nil
+	}
+	return *resp.Container, nil
+}
+
+func agentContainerAttach(ctx context.Context, vm vmInstance) (net.Conn, *guestproto.ContainerState, error) {
+	conn, resp, err := agentOpenStream(ctx, vm, guestproto.Request{
+		Op: guestproto.OpContainerAttach,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return conn, resp.Container, nil
+}
+
+func agentContainerSignal(ctx context.Context, vm vmInstance, req guestproto.ContainerSignalRequest) error {
+	_, err := agentRoundTrip(ctx, vm, guestproto.Request{
+		Op:              guestproto.OpContainerSignal,
+		ContainerSignal: &req,
+	})
+	return err
+}
+
+func agentContainerResize(ctx context.Context, vm vmInstance, req guestproto.ContainerResizeRequest) error {
+	_, err := agentRoundTrip(ctx, vm, guestproto.Request{
+		Op:              guestproto.OpContainerResize,
+		ContainerResize: &req,
+	})
+	return err
+}
+
+func agentContainerExec(ctx context.Context, vm vmInstance, req guestproto.ContainerExecRequest) (net.Conn, int, error) {
+	conn, resp, err := agentOpenStream(ctx, vm, guestproto.Request{
+		Op:            guestproto.OpContainerExec,
+		ContainerExec: &req,
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	return conn, resp.ExecPID, nil
+}
+
+func agentContainerTop(ctx context.Context, vm vmInstance) ([]guestproto.ContainerProcess, error) {
+	resp, err := agentRoundTrip(ctx, vm, guestproto.Request{
+		Op: guestproto.OpContainerTop,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return resp.Processes, nil
+}
+
+func agentContainerStats(ctx context.Context, vm vmInstance) (guestproto.ContainerStats, error) {
+	resp, err := agentRoundTrip(ctx, vm, guestproto.Request{
+		Op: guestproto.OpContainerStats,
+	})
+	if err != nil {
+		return guestproto.ContainerStats{}, err
+	}
+	if resp.Stats == nil {
+		return guestproto.ContainerStats{}, nil
+	}
+	return *resp.Stats, nil
+}
+
+func agentContainerPause(ctx context.Context, vm vmInstance) error {
+	_, err := agentRoundTrip(ctx, vm, guestproto.Request{
+		Op: guestproto.OpContainerPause,
+	})
+	return err
+}
+
+func agentContainerUnpause(ctx context.Context, vm vmInstance) error {
+	_, err := agentRoundTrip(ctx, vm, guestproto.Request{
+		Op: guestproto.OpContainerUnpause,
+	})
+	return err
+}
+
+func agentContainerStat(ctx context.Context, vm vmInstance, req guestproto.ContainerCopyRequest) (guestproto.ContainerPathStat, error) {
+	resp, err := agentRoundTrip(ctx, vm, guestproto.Request{
+		Op:            guestproto.OpContainerStat,
+		ContainerCopy: &req,
+	})
+	if err != nil {
+		return guestproto.ContainerPathStat{}, err
+	}
+	if resp.PathStat == nil {
+		return guestproto.ContainerPathStat{}, nil
+	}
+	return *resp.PathStat, nil
+}
+
+func agentContainerCopyFrom(ctx context.Context, vm vmInstance, req guestproto.ContainerCopyRequest) (net.Conn, *guestproto.ContainerPathStat, error) {
+	conn, resp, err := agentOpenStream(ctx, vm, guestproto.Request{
+		Op:            guestproto.OpContainerCopyFrom,
+		ContainerCopy: &req,
+	})
+	if err != nil {
+		return nil, nil, err
+	}
+	return conn, resp.PathStat, nil
+}
+
+func agentContainerCopyTo(ctx context.Context, vm vmInstance, req guestproto.ContainerCopyRequest) (net.Conn, error) {
+	conn, _, err := agentOpenStream(ctx, vm, guestproto.Request{
+		Op:            guestproto.OpContainerCopyTo,
+		ContainerCopy: &req,
+	})
+	return conn, err
+}
+
+func agentContainerExport(ctx context.Context, vm vmInstance, req guestproto.ContainerExportRequest) (net.Conn, error) {
+	conn, _, err := agentOpenStream(ctx, vm, guestproto.Request{
+		Op:              guestproto.OpContainerExport,
+		ContainerExport: &req,
+	})
+	return conn, err
 }
 
 // watchContextClose closes conn if ctx is canceled before the returned stop

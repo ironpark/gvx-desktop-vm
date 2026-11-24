@@ -5,21 +5,31 @@
 // Each connection opens with one request, a line of JSON, and gets one
 // response, a line of JSON. What follows depends on the op:
 //
-//   - hello, status, start, stop, shutdown: nothing; the helper closes.
+//   - hello, status, start, stop, shutdown, container-start, container-signal,
+//     container-resize, container-top, container-stats, container-pause,
+//     container-unpause, container-stat: nothing; the helper closes.
 //   - dial: when the response is OK, the connection carries the bytes of a
 //     stream in the guest (a service's socket) both ways from then on.
 //   - events: the helper writes an Event line whenever the VM's state
 //     changes, starting with the current one, until the client hangs up.
+//   - container-attach, container-exec: when the response is OK, the
+//     connection carries guestproto frames both ways (FrameStdin/FrameStdinEOF/
+//     FrameResize client->helper; FrameStdout/FrameStderr/FrameExit
+//     helper->client).
+//   - container-copy-from, container-export: when the response is OK, the
+//     helper streams guestproto FrameData frames terminated by FrameEOF.
+//   - container-copy-to: when the response is OK, the client streams
+//     guestproto FrameData frames terminated by FrameEOF, and the helper
+//     replies with one FrameEOF frame (empty on success, or UTF-8 error text).
 //
 // A request names the protocol version it speaks (V). The helper answers a
 // version it does not speak, and an op it does not know, with OK false and
 // a Code, so that a newer app can tell an older helper apart and an older
 // app can talk to a newer helper. New ops and new fields are added, never
-// changed: the protocol is meant to carry amd64 containers later
-// (docs/design/amd64-builder.md, "Later: amd64 containers").
+// changed: the protocol carries both the amd64 builder and per-container
+// micro-VMs.
 //
-// See docs/design/amd64-builder.md. Owner: frozen (architect). Ask the
-// coordinator before changing it.
+// See docs/design/amd64-builder.md and docs/design/amd64-microvm.md.
 package vmproto
 
 import (
@@ -28,7 +38,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"time"
+
+	"github.com/ironpark/gvx-desktop-vm/guestproto"
 )
 
 // Version is the protocol version this package speaks.
@@ -36,6 +49,13 @@ const Version = 1
 
 // MaxLine is the longest request or response line either side reads.
 const MaxLine = 1 << 20
+
+// Features advertised in Hello.Features.
+const (
+	// FeatureContainers indicates the helper supports VMSpec.Shares,
+	// VMSpec.ExtraDisks, and the container-* ops.
+	FeatureContainers = guestproto.FeatureContainers
+)
 
 // The ops.
 const (
@@ -58,21 +78,41 @@ const (
 	OpEvents = "events"
 	// OpShutdown stops the VM as OpStop does and makes the helper exit.
 	OpShutdown = "shutdown"
+
+	// Container ops (advertised via FeatureContainers), proxied between the
+	// control socket and the guest agent.
+	OpContainerStart    = guestproto.OpContainerStart
+	OpContainerAttach   = guestproto.OpContainerAttach
+	OpContainerSignal   = guestproto.OpContainerSignal
+	OpContainerResize   = guestproto.OpContainerResize
+	OpContainerExec     = guestproto.OpContainerExec
+	OpContainerTop      = guestproto.OpContainerTop
+	OpContainerStats    = guestproto.OpContainerStats
+	OpContainerPause    = guestproto.OpContainerPause
+	OpContainerUnpause  = guestproto.OpContainerUnpause
+	OpContainerStat     = guestproto.OpContainerStat
+	OpContainerCopyFrom = guestproto.OpContainerCopyFrom
+	OpContainerCopyTo   = guestproto.OpContainerCopyTo
+	OpContainerExport   = guestproto.OpContainerExport
 )
 
 // Codes, for a response with OK false.
 const (
-	CodeBadVersion  = "bad-version"   // V is one the helper does not speak
-	CodeUnknownOp   = "unknown-op"    // the op is not one the helper knows
-	CodeBadRequest  = "bad-request"   // the request is malformed or incomplete
-	CodeNotRunning  = "not-running"   // dial or a guest op with the VM stopped
-	CodeBusy        = "busy"          // start with another spec, or a stop under way
-	CodeUnsupported = "unsupported"   // this Mac cannot (no Rosetta, not Apple silicon, …)
-	CodeFailed      = "failed"        // the VM or a service failed; Error says how
-	CodeNoService   = "no-service"    // dial names a service the guest does not have
-	CodeGuest       = "guest-error"   // the guest agent refused; Error is its message
-	CodeInternal    = "internal"      // anything else
-	CodeShutdown    = "shutting-down" // the helper is exiting
+	CodeBadVersion    = "bad-version"    // V is one the helper does not speak
+	CodeUnknownOp     = "unknown-op"     // the op is not one the helper knows
+	CodeBadRequest    = "bad-request"    // the request is malformed or incomplete
+	CodeNotRunning    = "not-running"    // dial or a guest op with the VM or container stopped
+	CodeBusy          = "busy"           // start with another spec, or a stop under way
+	CodeUnsupported   = "unsupported"    // this Mac cannot (no Rosetta, not Apple silicon, …)
+	CodeFailed        = "failed"         // the VM or a service failed; Error says how
+	CodeNoService     = "no-service"     // dial names a service the guest does not have
+	CodeGuest         = "guest-error"    // the guest agent refused; Error is its message
+	CodeInternal      = "internal"       // anything else
+	CodeShutdown      = "shutting-down"  // the helper is exiting
+	CodeNotFound      = "not-found"      // container path or resource not found
+	CodeAlreadyPaused = "already-paused" // container is already paused
+	CodeNotPaused     = "not-paused"     // container is not paused
+	CodePaused        = "paused"         // operation refused while container is paused
 )
 
 // Request opens a connection.
@@ -82,6 +122,14 @@ type Request struct {
 	Start *StartRequest `json:"start,omitempty"`
 	Stop  *StopRequest  `json:"stop,omitempty"`
 	Dial  *DialRequest  `json:"dial,omitempty"`
+
+	// Container op payloads (FeatureContainers).
+	Container       *ContainerSpec          `json:"container,omitempty"`
+	ContainerExec   *ContainerExecRequest   `json:"containerExec,omitempty"`
+	ContainerSignal *ContainerSignalRequest `json:"containerSignal,omitempty"`
+	ContainerResize *ContainerResizeRequest `json:"containerResize,omitempty"`
+	ContainerCopy   *ContainerCopyRequest   `json:"containerCopy,omitempty"`
+	ContainerExport *ContainerExportRequest `json:"containerExport,omitempty"`
 }
 
 // Response answers a request.
@@ -91,6 +139,13 @@ type Response struct {
 	Code   string  `json:"code,omitempty"`
 	Hello  *Hello  `json:"hello,omitempty"`
 	Status *Status `json:"status,omitempty"`
+
+	// Container op results (FeatureContainers).
+	Container *ContainerState    `json:"container,omitempty"`
+	ExecPID   int                `json:"execPid,omitempty"`
+	Processes []ContainerProcess `json:"processes,omitempty"`
+	Stats     *ContainerStats    `json:"stats,omitempty"`
+	PathStat  *ContainerPathStat `json:"pathStat,omitempty"`
 }
 
 // Err is the response's failure as an error, nil when OK.
@@ -131,8 +186,13 @@ type Hello struct {
 	Helper string `json:"helper"`
 	PID    int    `json:"pid"`
 	// Features names optional abilities beyond the ops of Protocol, such as
-	// "balloon"; a client checks for one before relying on it.
+	// "balloon" or "containers"; a client checks for one before relying on it.
 	Features []string `json:"features,omitempty"`
+}
+
+// HasFeature reports whether Hello.Features includes name.
+func (h Hello) HasFeature(name string) bool {
+	return slices.Contains(h.Features, name)
 }
 
 // State is the VM's lifecycle state.
@@ -172,6 +232,21 @@ type ServiceStatus struct {
 	Err   string `json:"err,omitempty"`
 }
 
+// ShareSpec is a host directory shared with the guest over virtiofs.
+// The guest mounts it at /mnt/<Tag>.
+type ShareSpec struct {
+	Tag      string `json:"tag"`
+	Dir      string `json:"dir"`
+	ReadOnly bool   `json:"readOnly,omitempty"`
+}
+
+// ExtraDiskSpec is an additional raw disk image attached as virtio-blk after
+// VMSpec.Disk (/dev/vda), appearing in order as /dev/vdb, /dev/vdc, ...
+type ExtraDiskSpec struct {
+	Path     string `json:"path"`
+	ReadOnly bool   `json:"readOnly,omitempty"`
+}
+
 // VMSpec is the VM to boot. Paths are the host's, absolute.
 type VMSpec struct {
 	// Kernel is a bare arm64 Linux Image, Initrd the initramfs.
@@ -179,7 +254,8 @@ type VMSpec struct {
 	Initrd string `json:"initrd"`
 	// Assets is the asset directory, shared read-only with the guest under
 	// the tag guestproto.AssetsTag: the guest runs buildkitd from it.
-	Assets string `json:"assets"`
+	// Optional for container micro-VMs.
+	Assets string `json:"assets,omitempty"`
 	// CPUs and MemoryMiB size the VM.
 	CPUs      int `json:"cpus"`
 	MemoryMiB int `json:"memoryMiB"`
@@ -192,11 +268,36 @@ type VMSpec struct {
 	Network bool `json:"network"`
 	// Services are started in order once the guest is up and the disk is
 	// mounted, by name: what a name runs is the guest's to know
-	// (guestproto.ServiceBuildkitd).
+	// (guestproto.ServiceBuildkitd). May be nil for container micro-VMs.
 	Services []string `json:"services,omitempty"`
 	// CommandLine is added to the kernel command line.
 	CommandLine string `json:"commandLine,omitempty"`
+	// Shares are additional host directories shared over virtiofs (beyond
+	// Assets and Rosetta), mounted by the guest at /mnt/<Tag>.
+	Shares []ShareSpec `json:"shares,omitempty"`
+	// ExtraDisks are additional raw disk images attached as virtio-blk after
+	// Disk (/dev/vda), appearing as /dev/vdb, /dev/vdc, ...
+	ExtraDisks []ExtraDiskSpec `json:"extraDisks,omitempty"`
 }
+
+// Container protocol types, aliased from guestproto so vmproto clients do not
+// need to convert between identical host and guest container payloads.
+type (
+	ContainerSpec          = guestproto.ContainerSpec
+	LayerSource            = guestproto.LayerSource
+	ContainerMount         = guestproto.ContainerMount
+	ContainerExecRequest   = guestproto.ContainerExecRequest
+	ContainerSignalRequest = guestproto.ContainerSignalRequest
+	ContainerResizeRequest = guestproto.ContainerResizeRequest
+	ContainerCopyRequest   = guestproto.ContainerCopyRequest
+	ContainerExportRequest = guestproto.ContainerExportRequest
+	ContainerState         = guestproto.ContainerState
+	ContainerProcess       = guestproto.ContainerProcess
+	ContainerNetStats      = guestproto.ContainerNetStats
+	ContainerStats         = guestproto.ContainerStats
+	ContainerPathStat      = guestproto.ContainerPathStat
+	ContainerExit          = guestproto.Exit
+)
 
 // DiskSpec is a raw disk image on the host.
 type DiskSpec struct {

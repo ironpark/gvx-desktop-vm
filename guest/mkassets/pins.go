@@ -376,6 +376,11 @@ var requiredModules = []string{
 	"overlay", "veth",
 	"virtio_blk",
 	"ext4",
+	// v2: micro-VM container runtime (zero-copy EROFS + overlay/VPN networking)
+	"erofs",
+	"loop",
+	"tun",
+	"wireguard",
 }
 
 func recipeForOrigin(origin string) (aportsRecipe, bool) {

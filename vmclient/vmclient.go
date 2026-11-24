@@ -217,6 +217,13 @@ func (l Launcher) Launch(ctx context.Context) (*Client, error) {
 	return c, nil
 }
 
+// Connect returns a Client bound to an already-running helper's control socket.
+// Close on a connected client is a no-op because it does not own the helper's
+// stdin lease.
+func Connect(socket string) *Client {
+	return &Client{socket: socket}
+}
+
 // Socket is the helper's control socket.
 func (c *Client) Socket() string { return c.socket }
 
@@ -376,6 +383,9 @@ func (c *Client) Events(ctx context.Context, fn func(vmproto.Event)) error {
 // helper exit and waits for it.
 func (c *Client) Close(timeout time.Duration) error {
 	c.closeOnce.Do(func() {
+		if c.lease == nil {
+			return
+		}
 		if timeout <= 0 {
 			timeout = defaultCloseTimeout
 		}

@@ -104,6 +104,7 @@ type serviceEntry struct {
 type Server struct {
 	version       string
 	ops           sysOps
+	ctr           containerOps
 	diskMu        sync.Mutex
 	services      map[string]*serviceEntry
 	shutdownOnce  sync.Once
@@ -120,9 +121,14 @@ func NewServer(version string, ops sysOps) *Server {
 			pollInterval: servicePollInterval,
 		}
 	}
+	ctr := defaultContainerOps()
+	if c, ok := ops.(containerOps); ok {
+		ctr = c
+	}
 	return &Server{
 		version:       version,
 		ops:           ops,
+		ctr:           ctr,
 		services:      svcs,
 		shutdownDelay: 50 * time.Millisecond,
 	}
@@ -172,6 +178,32 @@ func (s *Server) ServeConn(conn io.ReadWriteCloser) {
 		s.handleDial(conn, br, req.Dial)
 	case guestproto.OpShutdown:
 		s.handleShutdown(conn)
+	case guestproto.OpContainerStart:
+		s.handleContainerStart(conn, req.Container)
+	case guestproto.OpContainerAttach:
+		s.handleContainerAttach(conn, br)
+	case guestproto.OpContainerSignal:
+		s.handleContainerSignal(conn, req.ContainerSignal)
+	case guestproto.OpContainerResize:
+		s.handleContainerResize(conn, req.ContainerResize)
+	case guestproto.OpContainerExec:
+		s.handleContainerExec(conn, br, req.ContainerExec)
+	case guestproto.OpContainerTop:
+		s.handleContainerTop(conn)
+	case guestproto.OpContainerStats:
+		s.handleContainerStats(conn)
+	case guestproto.OpContainerPause:
+		s.handleContainerPause(conn)
+	case guestproto.OpContainerUnpause:
+		s.handleContainerUnpause(conn)
+	case guestproto.OpContainerStat:
+		s.handleContainerStat(conn, req.ContainerCopy)
+	case guestproto.OpContainerCopyFrom:
+		s.handleContainerCopyFrom(conn, req.ContainerCopy)
+	case guestproto.OpContainerCopyTo:
+		s.handleContainerCopyTo(conn, br, req.ContainerCopy)
+	case guestproto.OpContainerExport:
+		s.handleContainerExport(conn, req.ContainerExport)
 	default:
 		_ = vmproto.WriteLine(conn, guestproto.Response{
 			OK:    false,
@@ -193,6 +225,7 @@ func (s *Server) handleHello(w io.Writer) {
 			Machine:     info.Machine,
 			Rosetta:     info.Rosetta,
 			Uptime:      info.Uptime,
+			Features:    []string{guestproto.FeatureContainers},
 		},
 	})
 }
@@ -666,6 +699,13 @@ func (s *Server) handleDial(conn io.ReadWriteCloser, br *bufio.Reader, req *gues
 }
 
 func (s *Server) handleShutdown(conn io.ReadWriteCloser) {
+	// Stop any running container and unmount its overlay/layers/volumes before
+	// unmounting /var/lib/gvx so every filesystem flushes cleanly before poweroff.
+	if s.ctr != nil {
+		if err := s.ctr.Shutdown(defaultShutdownStopTimeout); err != nil {
+			log.Printf("shutdown container: %v", err)
+		}
+	}
 	// Stop all services, sync, and unmount the persistent disk before
 	// replying so the filesystem is clean before poweroff.
 	for _, name := range serviceOrder {
@@ -694,6 +734,400 @@ func (s *Server) handleShutdown(conn io.ReadWriteCloser) {
 			s.ops.PowerOff()
 		}()
 	})
+}
+
+func writeCodedError(w io.Writer, err error) {
+	_ = vmproto.WriteLine(w, guestproto.Response{
+		OK:    false,
+		Code:  errorCodeOf(err),
+		Error: err.Error(),
+	})
+}
+
+func (s *Server) handleContainerStart(w io.Writer, req *guestproto.ContainerSpec) {
+	if req == nil {
+		_ = vmproto.WriteLine(w, guestproto.Response{
+			OK:    false,
+			Code:  guestproto.CodeBadRequest,
+			Error: "container spec is required",
+		})
+		return
+	}
+	state, err := s.ctr.Start(*req)
+	if err != nil {
+		writeCodedError(w, err)
+		return
+	}
+	_ = vmproto.WriteLine(w, guestproto.Response{
+		OK:        true,
+		Container: &state,
+	})
+}
+
+func (s *Server) handleContainerAttach(conn io.ReadWriteCloser, br *bufio.Reader) {
+	state, hub, writeStdin, closeStdin, resize, err := s.ctr.Attach()
+	if err != nil {
+		writeCodedError(conn, err)
+		return
+	}
+	if err := vmproto.WriteLine(conn, guestproto.Response{
+		OK:        true,
+		Container: &state,
+	}); err != nil {
+		return
+	}
+
+	stopCh := make(chan struct{})
+	var stopOnce sync.Once
+	stop := func() { stopOnce.Do(func() { close(stopCh) }) }
+
+	// Read host->guest frames (stdin, stdinEOF, resize) until EOF or error.
+	go func() {
+		defer stop()
+		for {
+			kind, payload, err := guestproto.ReadFrame(br)
+			if err != nil {
+				return
+			}
+			switch kind {
+			case guestproto.FrameStdin:
+				if len(payload) > 0 && writeStdin != nil {
+					_ = writeStdin(payload)
+				}
+			case guestproto.FrameStdinEOF:
+				if closeStdin != nil {
+					_ = closeStdin()
+				}
+			case guestproto.FrameResize:
+				if resize != nil {
+					var rr guestproto.ContainerResizeRequest
+					if json.Unmarshal(payload, &rr) == nil {
+						_ = resize(rr.Rows, rr.Cols)
+					}
+				}
+			}
+		}
+	}()
+
+	var writeMu sync.Mutex
+	sendChunk := func(kind byte, p []byte) error {
+		for len(p) > 0 {
+			n := len(p)
+			if n > guestproto.MaxFrame {
+				n = guestproto.MaxFrame
+			}
+			writeMu.Lock()
+			err := guestproto.WriteFrame(conn, kind, p[:n])
+			writeMu.Unlock()
+			if err != nil {
+				return err
+			}
+			p = p[n:]
+		}
+		return nil
+	}
+
+	ex, exited, err := hub.Stream(stopCh, sendChunk)
+	if err != nil || !exited {
+		return
+	}
+	payload, _ := json.Marshal(ex)
+	writeMu.Lock()
+	_ = guestproto.WriteFrame(conn, guestproto.FrameExit, payload)
+	writeMu.Unlock()
+}
+
+func (s *Server) handleContainerSignal(w io.Writer, req *guestproto.ContainerSignalRequest) {
+	var sr guestproto.ContainerSignalRequest
+	if req != nil {
+		sr = *req
+	}
+	if err := s.ctr.Signal(sr); err != nil {
+		writeCodedError(w, err)
+		return
+	}
+	_ = vmproto.WriteLine(w, guestproto.Response{OK: true})
+}
+
+func (s *Server) handleContainerResize(w io.Writer, req *guestproto.ContainerResizeRequest) {
+	if req == nil {
+		_ = vmproto.WriteLine(w, guestproto.Response{
+			OK:    false,
+			Code:  guestproto.CodeBadRequest,
+			Error: "resize request is required",
+		})
+		return
+	}
+	if err := s.ctr.Resize(req.Rows, req.Cols); err != nil {
+		writeCodedError(w, err)
+		return
+	}
+	_ = vmproto.WriteLine(w, guestproto.Response{OK: true})
+}
+
+func (s *Server) handleContainerExec(conn io.ReadWriteCloser, br *bufio.Reader, req *guestproto.ContainerExecRequest) {
+	if req == nil || len(req.Argv) == 0 {
+		_ = vmproto.WriteLine(conn, guestproto.Response{
+			OK:    false,
+			Code:  guestproto.CodeBadRequest,
+			Error: "container exec requires argv",
+		})
+		return
+	}
+	proc, err := s.ctr.Exec(*req)
+	if err != nil {
+		writeCodedError(conn, err)
+		return
+	}
+	defer proc.Close()
+
+	if err := vmproto.WriteLine(conn, guestproto.Response{
+		OK:      true,
+		ExecPID: proc.PID(),
+	}); err != nil {
+		return
+	}
+
+	// Pump stdin and resize frames from host to exec process.
+	go func() {
+		for {
+			kind, payload, err := guestproto.ReadFrame(br)
+			if err != nil {
+				_ = proc.CloseStdin()
+				return
+			}
+			switch kind {
+			case guestproto.FrameStdin:
+				if len(payload) > 0 {
+					_ = proc.WriteStdin(payload)
+				}
+			case guestproto.FrameStdinEOF:
+				_ = proc.CloseStdin()
+			case guestproto.FrameResize:
+				var rr guestproto.ContainerResizeRequest
+				if json.Unmarshal(payload, &rr) == nil {
+					_ = proc.Resize(rr.Rows, rr.Cols)
+				}
+			}
+		}
+	}()
+
+	var writeMu sync.Mutex
+	sendFrame := func(kind byte, p []byte) error {
+		for len(p) > 0 {
+			n := len(p)
+			if n > guestproto.MaxFrame {
+				n = guestproto.MaxFrame
+			}
+			writeMu.Lock()
+			err := guestproto.WriteFrame(conn, kind, p[:n])
+			writeMu.Unlock()
+			if err != nil {
+				return err
+			}
+			p = p[n:]
+		}
+		return nil
+	}
+
+	outDone := make(chan struct{})
+	go func() {
+		defer close(outDone)
+		proc.StreamOutput(sendFrame)
+	}()
+
+	ex := proc.Wait()
+	select {
+	case <-outDone:
+	case <-time.After(500 * time.Millisecond):
+		proc.Close()
+		<-outDone
+	}
+
+	payload, _ := json.Marshal(ex)
+	writeMu.Lock()
+	_ = guestproto.WriteFrame(conn, guestproto.FrameExit, payload)
+	writeMu.Unlock()
+}
+
+func (s *Server) handleContainerTop(w io.Writer) {
+	procs, err := s.ctr.Top()
+	if err != nil {
+		writeCodedError(w, err)
+		return
+	}
+	_ = vmproto.WriteLine(w, guestproto.Response{
+		OK:        true,
+		Processes: procs,
+	})
+}
+
+func (s *Server) handleContainerStats(w io.Writer) {
+	st, err := s.ctr.Stats()
+	if err != nil {
+		writeCodedError(w, err)
+		return
+	}
+	_ = vmproto.WriteLine(w, guestproto.Response{
+		OK:    true,
+		Stats: &st,
+	})
+}
+
+func (s *Server) handleContainerPause(w io.Writer) {
+	if err := s.ctr.Pause(); err != nil {
+		writeCodedError(w, err)
+		return
+	}
+	_ = vmproto.WriteLine(w, guestproto.Response{OK: true})
+}
+
+func (s *Server) handleContainerUnpause(w io.Writer) {
+	if err := s.ctr.Unpause(); err != nil {
+		writeCodedError(w, err)
+		return
+	}
+	_ = vmproto.WriteLine(w, guestproto.Response{OK: true})
+}
+
+func (s *Server) handleContainerStat(w io.Writer, req *guestproto.ContainerCopyRequest) {
+	if req == nil || req.Path == "" {
+		_ = vmproto.WriteLine(w, guestproto.Response{
+			OK:    false,
+			Code:  guestproto.CodeBadRequest,
+			Error: "path is required",
+		})
+		return
+	}
+	st, err := s.ctr.Stat(*req)
+	if err != nil {
+		writeCodedError(w, err)
+		return
+	}
+	_ = vmproto.WriteLine(w, guestproto.Response{
+		OK:       true,
+		PathStat: &st,
+	})
+}
+
+func (s *Server) handleContainerCopyFrom(conn io.ReadWriteCloser, req *guestproto.ContainerCopyRequest) {
+	if req == nil || req.Path == "" {
+		_ = vmproto.WriteLine(conn, guestproto.Response{
+			OK:    false,
+			Code:  guestproto.CodeBadRequest,
+			Error: "path is required",
+		})
+		return
+	}
+	st, streamFn, err := s.ctr.CopyFrom(*req)
+	if err != nil {
+		writeCodedError(conn, err)
+		return
+	}
+	if err := vmproto.WriteLine(conn, guestproto.Response{
+		OK:       true,
+		PathStat: &st,
+	}); err != nil {
+		return
+	}
+	streamTarResponse(conn, streamFn)
+}
+
+func (s *Server) handleContainerCopyTo(conn io.ReadWriteCloser, br *bufio.Reader, req *guestproto.ContainerCopyRequest) {
+	if req == nil || req.Path == "" {
+		_ = vmproto.WriteLine(conn, guestproto.Response{
+			OK:    false,
+			Code:  guestproto.CodeBadRequest,
+			Error: "path is required",
+		})
+		return
+	}
+	extractFn, err := s.ctr.CopyTo(*req)
+	if err != nil {
+		writeCodedError(conn, err)
+		return
+	}
+	if err := vmproto.WriteLine(conn, guestproto.Response{OK: true}); err != nil {
+		return
+	}
+
+	pr, pw := io.Pipe()
+	go func() {
+		for {
+			kind, payload, err := guestproto.ReadFrame(br)
+			if err != nil {
+				_ = pw.CloseWithError(err)
+				return
+			}
+			switch kind {
+			case guestproto.FrameData:
+				if len(payload) > 0 {
+					if _, err := pw.Write(payload); err != nil {
+						return
+					}
+				}
+			case guestproto.FrameEOF:
+				if len(payload) > 0 {
+					_ = pw.CloseWithError(errors.New(string(payload)))
+				} else {
+					_ = pw.Close()
+				}
+				return
+			default:
+				_ = pw.CloseWithError(fmt.Errorf("unexpected copy-to frame kind %d", kind))
+				return
+			}
+		}
+	}()
+
+	extractErr := extractFn(pr)
+	if extractErr == nil {
+		// Drain trailing tar padding until host sends FrameEOF (which may carry
+		// a mid-stream error from the sender).
+		if _, drainErr := io.Copy(io.Discard, pr); drainErr != nil {
+			extractErr = drainErr
+		}
+	}
+	_ = pr.Close()
+
+	if extractErr != nil {
+		_ = guestproto.WriteFrame(conn, guestproto.FrameEOF, []byte(extractErr.Error()))
+		return
+	}
+	_ = guestproto.WriteFrame(conn, guestproto.FrameEOF, nil)
+}
+
+func (s *Server) handleContainerExport(conn io.ReadWriteCloser, req *guestproto.ContainerExportRequest) {
+	var er guestproto.ContainerExportRequest
+	if req != nil {
+		er = *req
+	}
+	streamFn, err := s.ctr.Export(er)
+	if err != nil {
+		writeCodedError(conn, err)
+		return
+	}
+	if err := vmproto.WriteLine(conn, guestproto.Response{OK: true}); err != nil {
+		return
+	}
+	streamTarResponse(conn, streamFn)
+}
+
+func streamTarResponse(conn io.Writer, streamFn func(io.Writer) error) {
+	var mu sync.Mutex
+	fw := frameWriter{mu: &mu, w: conn, kind: guestproto.FrameData}
+	bw := bufio.NewWriterSize(fw, 64*1024)
+	err := streamFn(bw)
+	if err == nil {
+		err = bw.Flush()
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if err != nil {
+		_ = guestproto.WriteFrame(conn, guestproto.FrameEOF, []byte(err.Error()))
+		return
+	}
+	_ = guestproto.WriteFrame(conn, guestproto.FrameEOF, nil)
 }
 
 // tailBuffer keeps the last max bytes written, for error reporting.

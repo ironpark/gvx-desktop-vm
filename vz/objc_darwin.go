@@ -103,21 +103,21 @@ func initRuntime() error {
 			{
 				Cmd: sel("guestDidStopVirtualMachine:"),
 				Fn: func(self objc.ID, _ objc.SEL, _ objc.ID) {
-					p := poolPush()
-					defer poolPop(p)
-					if v, ok := delegates.Load(self); ok {
-						v.(*VM).markStopped(nil)
-					}
+					withPool(func() {
+						if v, ok := delegates.Load(self); ok {
+							v.(*VM).markStopped(nil)
+						}
+					})
 				},
 			},
 			{
 				Cmd: sel("virtualMachine:didStopWithError:"),
 				Fn: func(self objc.ID, _ objc.SEL, _ objc.ID, e objc.ID) {
-					p := poolPush()
-					defer poolPop(p)
-					if v, ok := delegates.Load(self); ok {
-						v.(*VM).markStopped(nserr(e))
-					}
+					withPool(func() {
+						if v, ok := delegates.Load(self); ok {
+							v.(*VM).markStopped(nserr(e))
+						}
+					})
 				},
 			},
 		})
@@ -130,8 +130,13 @@ func initRuntime() error {
 	return rtErr
 }
 
-// withPool runs f inside an Objective-C autorelease pool.
+// withPool runs f inside an Objective-C autorelease pool on a locked OS
+// thread. libobjc's autorelease pool stack is pthread-local, so poolPush and
+// poolPop must execute on the same OS thread even if f triggers syscalls or
+// preemption.
 func withPool(f func()) {
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
 	p := poolPush()
 	defer poolPop(p)
 	f()
@@ -142,9 +147,7 @@ func withPool(f func()) {
 func onQueue(q uintptr, f func()) {
 	h := nextHandle.Add(1)
 	handles.Store(h, func() {
-		p := poolPush()
-		defer poolPop(p)
-		f()
+		withPool(f)
 	})
 	dispatchSyncF(q, h, trampoline)
 }
@@ -176,7 +179,9 @@ func autorelease(id objc.ID) objc.ID {
 
 func release(id objc.ID) {
 	if id != 0 {
-		id.Send(sel("release"))
+		withPool(func() {
+			id.Send(sel("release"))
+		})
 	}
 }
 
